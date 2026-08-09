@@ -88,6 +88,9 @@ apple-artwork --version
 ### Run the script directly
 
 ```bash
+git clone https://github.com/YellowSnowman23/Apple-Music-Artwork-Fetcher.git
+cd Apple-Music-Artwork-Fetcher
+
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -97,6 +100,9 @@ python apple_artwork.py --version
 ### Install for development and tests
 
 ```bash
+git clone https://github.com/YellowSnowman23/Apple-Music-Artwork-Fetcher.git
+cd Apple-Music-Artwork-Fetcher
+
 python -m pip install -e '.[dev]'
 ```
 
