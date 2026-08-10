@@ -464,7 +464,7 @@ I built this for my own Fedora music library and am sharing it in case it helps 
 
 ## Use of AI/LLM Transparency
 
-This project was developed with substantial assistance from large language models (LLMs), including code drafting, test design, documentation, and review. Automated tests, linting, package validation, and targeted safety checks were run, but AI-generated code and documentation can still contain mistakes.
+This project was developed with substantial assistance from large language models (LLMs) (specifically GPT-5.6 Sol on Ultra), including code drafting, test design, documentation, and review. Automated tests, linting, package validation, and targeted safety checks were run, but AI-generated code and documentation can still contain mistakes.
 
 This is a personal-use tool provided **AS IS**. Review the code, test on disposable copies, and keep a current backup or filesystem snapshot before using `--apply` on a real music library.
 
