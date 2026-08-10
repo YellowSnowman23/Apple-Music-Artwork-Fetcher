@@ -6,7 +6,7 @@ Dry-run is the default. Audio files change only when you pass `--apply`.
 
 ## Major updates from the original script
 
-This project replaces the workflow described in the old README. The new program is a ground-up rewrite of that folder-cover tool.
+This project replaces the workflow described in the [original README][original-readme] and implemented by [`fetch_mzstatic_covers.py`][original-script]. The new program is a ground-up rewrite of that folder-cover tool.
 
 | Area | Original script | Current version |
 |---|---|---|
@@ -55,6 +55,20 @@ A valid barcode can trigger an exact Apple lookup and provide identifier evidenc
 
 The tool does not upload, fingerprint, or decode audio for catalog matching.
 
+## Architecture
+
+The implementation is an importable `apple_music_artwork` package. The small top-level `apple_artwork.py` file remains as a compatibility facade and direct-script launcher.
+
+Format-specific metadata handling is intentionally isolated under `apple_music_artwork/adapters/`:
+
+- `flac.py` — native FLAC picture blocks;
+- `xiph.py` — Ogg Vorbis and Opus `METADATA_BLOCK_PICTURE` fields;
+- `mp4.py` — M4A/MP4 `covr` atoms and audio-only container validation;
+- `id3.py` — MP3, WAVE, and AIFF APIC frames;
+- `wavpack.py` — WavPack APEv2 front-cover fields.
+
+Each adapter owns its format-family preflight, front-art inspection, mutation, and post-write artwork verification. The shared embedding layer owns staging, encoded-audio and unrelated-metadata preservation checks, compare-and-swap replacement, rollback, and durability. Keeping those responsibilities separate makes a format bug less likely to leak into unrelated containers.
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -81,16 +95,13 @@ Download the wheel attached to the corresponding [GitHub release][releases], the
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "/path/to/apple_music_artwork_embedder-2.0.3-py3-none-any.whl"
+python -m pip install "/path/to/apple_music_artwork_embedder-2.1.1-py3-none-any.whl"
 apple-artwork --version
 ```
 
 ### Run the script directly
 
 ```bash
-git clone https://github.com/YellowSnowman23/Apple-Music-Artwork-Fetcher.git
-cd Apple-Music-Artwork-Fetcher
-
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -100,9 +111,6 @@ python apple_artwork.py --version
 ### Install for development and tests
 
 ```bash
-git clone https://github.com/YellowSnowman23/Apple-Music-Artwork-Fetcher.git
-cd Apple-Music-Artwork-Fetcher
-
 python -m pip install -e '.[dev]'
 ```
 
@@ -326,6 +334,8 @@ Statuses have different scopes:
 
 | Status | Scope | Meaning |
 |---|---|---|
+| `in_progress` | Top-level report | Durable checkpoint written before each successful mutation call returns; if checkpoint persistence itself fails after commit, the CLI explicitly reports that it was not confirmed |
+| `complete` | Top-level report | Processing and final report serialization completed successfully |
 | `dry-run` | Album | A candidate matched and files were only preflighted |
 | `no_match` | Album | No candidate passed the identity and tracklist gates |
 | `low_confidence` | Album | The best candidate did not clear the score requirements |
@@ -450,13 +460,7 @@ The live test contacts Apple's public iTunes and `mzstatic` endpoints.
 
 ## Project scope
 
-I built this for my own music library and am sharing it in case it helps someone else. It comes without support or warranty. The code is designed around practical protection from accidental corruption, not hostile same-user processes, debugger attacks, or deliberate syscall races.
-
-## Use of AI/LLM Transparency
-
-This project was developed with substantial assistance from large language models (LLMs) (specifically GPT-5.6 Sol on Ultra), including code drafting, test design, documentation, and review. Automated tests, linting, package validation, and targeted safety checks were run, but AI-generated code and documentation can still contain mistakes.
-
-This is a personal-use tool provided **AS IS**. Review the code, test on disposable copies, and keep a current backup or filesystem snapshot before using `--apply` on a real music library.
+I built this for my own Fedora music library and am sharing it in case it helps someone else. It comes without support or warranty. The code is designed around practical protection from accidental corruption, not hostile same-user processes, debugger attacks, or deliberate syscall races.
 
 ## Acknowledgements
 
