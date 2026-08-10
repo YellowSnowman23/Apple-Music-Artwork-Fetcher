@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apple-music-artwork-embedder"
-version = "2.0.3"
+version = "2.1.1"
 description = "Accuracy-first Apple mzstatic artwork matching and embedding"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,13 +33,19 @@ dev = [
 ]
 
 [project.scripts]
-apple-artwork = "apple_artwork:main"
+apple-artwork = "apple_music_artwork.cli:main"
 
 [project.urls]
 Repository = "https://github.com/YellowSnowman23/Apple-Music-Artwork-Fetcher"
 
 [tool.setuptools]
 py-modules = ["apple_artwork"]
+
+[tool.setuptools.packages.find]
+include = ["apple_music_artwork*"]
+
+[tool.check-wheel-contents]
+toplevel = ["apple_artwork.py", "apple_music_artwork"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
