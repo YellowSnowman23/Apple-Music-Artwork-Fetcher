@@ -11,7 +11,8 @@ from mutagen.wave import WAVE
 from PIL import Image
 
 import apple_artwork
-from apple_artwork import EmbedError, EmbedResult, decode_artwork, embed_artwork
+import apple_music_artwork.embedding as embedding
+from apple_artwork import Artwork, EmbedError, EmbedResult, decode_artwork, embed_artwork
 
 
 def make_audio(path: Path, codec: str) -> None:
@@ -174,7 +175,7 @@ def test_concurrent_source_edit_is_not_overwritten(
         path.write_bytes(concurrent)
         return EmbedResult("embedded", "MP3", "simulated staged success")
 
-    monkeypatch.setattr(apple_artwork, "_embed_artwork_in_place", staged_success)
+    monkeypatch.setattr(embedding, "_embed_artwork_in_place", staged_success)
 
     with pytest.raises(EmbedError, match=r"changed|concurrent"):
         embed_artwork(path, artwork("JPEG"), replace_existing=True)
@@ -194,7 +195,7 @@ def test_postwrite_metadata_change_aborts_before_commit(
     audio.tags.add(TIT2(encoding=3, text=["Original title"]))
     audio.save()
     before = path.read_bytes()
-    real_embed = apple_artwork._embed_artwork_in_place
+    real_embed = embedding._embed_artwork_in_place
 
     def corrupt_metadata(
         temporary: int,
@@ -218,12 +219,68 @@ def test_postwrite_metadata_change_aborts_before_commit(
             staged.save(handle)
         return result
 
-    monkeypatch.setattr(apple_artwork, "_embed_artwork_in_place", corrupt_metadata)
+    monkeypatch.setattr(embedding, "_embed_artwork_in_place", corrupt_metadata)
 
     with pytest.raises(EmbedError, match=r"metadata|preserv"):
         embed_artwork(path, artwork("JPEG"), replace_existing=True)
 
     assert path.read_bytes() == before
+
+
+def test_nonfront_flac_picture_facts_are_part_of_preservation_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "picture-facts.flac"
+    make_audio(path, "flac")
+    back = Picture()
+    back.type = PictureType.COVER_BACK
+    back.mime = "image/png"
+    back.desc = "Back cover"
+    back.width = 48
+    back.height = 48
+    back.depth = 24
+    back.colors = 0
+    back.data = image_bytes((0, 0, 255))
+    audio = FLAC(path)
+    audio.add_picture(back)
+    audio.save()
+    before = path.read_bytes()
+    real_embed = embedding._embed_artwork_in_place
+
+    def corrupt_picture_fact(
+        temporary: int,
+        new_artwork: Artwork,
+        *,
+        replace_existing: bool = False,
+        display_path: Path | None = None,
+    ) -> EmbedResult:
+        result = real_embed(
+            temporary,
+            new_artwork,
+            replace_existing=replace_existing,
+            display_path=display_path,
+        )
+        with os.fdopen(os.dup(temporary), "r+b") as handle:
+            handle.seek(0)
+            staged = FLAC(handle)
+            staged_back = next(
+                picture for picture in staged.pictures if picture.type == PictureType.COVER_BACK
+            )
+            staged_back.width = 999
+            handle.seek(0)
+            staged.save(handle)
+        return result
+
+    monkeypatch.setattr(embedding, "_embed_artwork_in_place", corrupt_picture_fact)
+
+    with pytest.raises(EmbedError, match=r"metadata|preserv"):
+        embed_artwork(path, artwork(), replace_existing=True)
+
+    assert path.read_bytes() == before
+    preserved = next(
+        picture for picture in FLAC(path).pictures if picture.type == PictureType.COVER_BACK
+    )
+    assert preserved.width == 48
 
 
 def test_id3v22_is_refused_for_every_id3_backed_container(

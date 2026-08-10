@@ -82,6 +82,40 @@ def test_embed_flac_replaces_only_front_cover_and_preserves_other_metadata(tmp_p
     ] == [old_back]
 
 
+@pytest.mark.parametrize(
+    ("suffix", "codec", "loader"),
+    (
+        (".mp3", "libmp3lame", MP3),
+        (".wav", "pcm_s16le", WAVE),
+        (".aiff", "pcm_s16be", AIFF),
+    ),
+)
+def test_embed_first_artwork_into_tagless_id3_container(
+    tmp_path: Path,
+    suffix: str,
+    codec: str,
+    loader: type[MP3] | type[WAVE] | type[AIFF],
+) -> None:
+    path = tmp_path / f"tagless{suffix}"
+    make_audio(path, codec)
+    initial = loader(path)
+    initial.delete()
+    assert loader(path).tags is None
+    new_front = image_bytes((0, 255, 0))
+    artwork = decode_artwork(new_front, "https://a5.mzstatic.com/master.png")
+
+    result = embed_artwork(path, artwork)
+
+    updated = loader(path)
+    assert result.status == "embedded"
+    assert updated.tags is not None
+    assert [
+        picture.data
+        for picture in updated.tags.getall("APIC")
+        if picture.type == PictureType.COVER_FRONT
+    ] == [new_front]
+
+
 def test_embed_mp3_replaces_front_apic_and_preserves_other_id3_frames(tmp_path: Path) -> None:
     path = tmp_path / "track.mp3"
     make_audio(path, "libmp3lame")

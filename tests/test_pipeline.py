@@ -11,6 +11,8 @@ from mutagen.mp4 import MP4
 from PIL import Image
 
 import apple_artwork
+import apple_music_artwork.cli as cli
+import apple_music_artwork.pipeline as pipeline
 from apple_artwork import (
     AlbumGroup,
     Artwork,
@@ -103,13 +105,11 @@ def test_process_library_dry_run_matches_but_never_downloads_or_embeds(
     tmp_path: Path, monkeypatch
 ) -> None:
     tracks = local_tracks(tmp_path)
-    monkeypatch.setattr(
-        apple_artwork, "discover_audio_files", lambda _root: [t.path for t in tracks]
-    )
+    monkeypatch.setattr(pipeline, "discover_audio_files", lambda _root: [t.path for t in tracks])
     by_path = {track.path: track for track in tracks}
-    monkeypatch.setattr(apple_artwork, "read_track_metadata", by_path.get)
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
     monkeypatch.setattr(
-        apple_artwork,
+        pipeline,
         "embed_artwork",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("dry-run must not embed artwork")
@@ -121,7 +121,7 @@ def test_process_library_dry_run_matches_but_never_downloads_or_embeds(
         preflighted.append(path)
         return EmbedResult("ready", path.suffix, "safe")
 
-    monkeypatch.setattr(apple_artwork, "preflight_artwork", fake_preflight)
+    monkeypatch.setattr(pipeline, "preflight_artwork", fake_preflight)
     emitted: list[str] = []
 
     report = process_library(
@@ -153,12 +153,12 @@ def test_process_library_verbose_emits_progress_and_candidate_diagnostics(
 ) -> None:
     tracks = local_tracks(tmp_path)
     monkeypatch.setattr(
-        apple_artwork, "discover_audio_files", lambda _root: [track.path for track in tracks]
+        pipeline, "discover_audio_files", lambda _root: [track.path for track in tracks]
     )
     by_path = {track.path: track for track in tracks}
-    monkeypatch.setattr(apple_artwork, "read_track_metadata", by_path.get)
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
     monkeypatch.setattr(
-        apple_artwork,
+        pipeline,
         "preflight_artwork",
         lambda path, *_args, **_kwargs: EmbedResult("ready", path.suffix, "safe"),
     )
@@ -218,14 +218,14 @@ def test_process_library_omits_00_folders_unless_apply_dcc_is_enabled(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"disposable test audio")
 
-    monkeypatch.setattr(apple_artwork, "discover_audio_files", lambda _root: paths)
+    monkeypatch.setattr(pipeline, "discover_audio_files", lambda _root: paths)
     inspected: list[Path] = []
 
     def record_metadata(path: Path, **_kwargs: object) -> None:
         inspected.append(path)
         return None
 
-    monkeypatch.setattr(apple_artwork, "read_track_metadata", record_metadata)
+    monkeypatch.setattr(pipeline, "read_track_metadata", record_metadata)
 
     report = process_library(
         root,
@@ -250,7 +250,7 @@ def test_apply_dcc_cli_flag_does_not_enable_mutation(tmp_path: Path, monkeypatch
         captured.update(kwargs)
         return {"summary": {"failed": 0}}
 
-    monkeypatch.setattr(apple_artwork, "process_library", fake_process)
+    monkeypatch.setattr(cli, "process_library", fake_process)
 
     exit_code = apple_artwork.main([str(tmp_path), "--apply-dcc", "--no-report"])
 
@@ -270,7 +270,7 @@ def test_verbose_cli_aliases_do_not_enable_mutation(
         captured.update(kwargs)
         return {"summary": {"failed": 0}}
 
-    monkeypatch.setattr(apple_artwork, "process_library", fake_process)
+    monkeypatch.setattr(cli, "process_library", fake_process)
 
     exit_code = apple_artwork.main([str(tmp_path), flag, "--no-report"])
 
@@ -297,7 +297,7 @@ def test_main_defaults_to_current_directory_and_dry_run(tmp_path: Path, monkeypa
             }
         }
 
-    monkeypatch.setattr(apple_artwork, "process_library", fake_process)
+    monkeypatch.setattr(cli, "process_library", fake_process)
 
     exit_code = apple_artwork.main([])
 
@@ -436,10 +436,10 @@ def test_apply_preflights_entire_album_before_any_embed(
 ) -> None:
     tracks = local_tracks(tmp_path)
     monkeypatch.setattr(
-        apple_artwork, "discover_audio_files", lambda _root: [track.path for track in tracks]
+        pipeline, "discover_audio_files", lambda _root: [track.path for track in tracks]
     )
     by_path = {track.path: track for track in tracks}
-    monkeypatch.setattr(apple_artwork, "read_track_metadata", by_path.get)
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
     image = io.BytesIO()
     Image.new("RGB", (64, 64), (12, 34, 56)).save(image, format="PNG")
     selected_artwork = decode_artwork(image.getvalue(), "https://a5.mzstatic.com/master.png")
@@ -454,9 +454,9 @@ def test_apply_preflights_entire_album_before_any_embed(
         return EmbedResult("ready", path.suffix, "safe")
 
     embedded: list[Path] = []
-    monkeypatch.setattr(apple_artwork, "preflight_artwork", fake_preflight)
+    monkeypatch.setattr(pipeline, "preflight_artwork", fake_preflight)
     monkeypatch.setattr(
-        apple_artwork,
+        pipeline,
         "embed_artwork",
         lambda path, *_args, **_kwargs: embedded.append(path),
     )
@@ -501,7 +501,7 @@ def test_main_prints_stable_low_confidence_and_metadata_failure_fields(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
-        apple_artwork,
+        cli,
         "process_library",
         lambda *_args, **_kwargs: {
             "summary": {

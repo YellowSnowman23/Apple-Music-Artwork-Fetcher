@@ -7,7 +7,7 @@ from contextlib import suppress
 from pathlib import Path
 
 import pytest
-from mutagen.apev2 import APEBinaryValue, APEv2
+from mutagen.apev2 import APEBinaryValue, APETextValue, APEv2
 from mutagen.flac import FLAC
 from mutagen.id3 import APIC, ID3, TIT2, PictureType
 from mutagen.mp3 import MP3
@@ -15,6 +15,9 @@ from mutagen.wavpack import WavPack
 from PIL import Image
 
 import apple_artwork
+import apple_music_artwork.cli as cli
+import apple_music_artwork.embedding as embedding
+import apple_music_artwork.pipeline as pipeline
 from apple_artwork import (
     AlbumGroup,
     AppleCatalogClient,
@@ -23,7 +26,9 @@ from apple_artwork import (
     ArtworkError,
     CatalogAlbum,
     CatalogTrack,
+    EmbedCommittedError,
     EmbedError,
+    EmbedResult,
     TrackMetadata,
     choose_match,
     decode_artwork,
@@ -269,7 +274,7 @@ def test_report_write_is_reserved_before_any_audio_mutation(
             return artwork()
 
     monkeypatch.setattr(
-        apple_artwork,
+        pipeline,
         "_write_json_report",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("report denied")),
     )
@@ -306,11 +311,17 @@ def test_postcommit_durability_failure_rolls_back_before_backup_release(
 ) -> None:
     path = tmp_path / "durability.mp3"
     make_audio(path, "libmp3lame")
-    monkeypatch.setattr(
-        apple_artwork,
-        "_fsync_directory_descriptor",
-        lambda _descriptor: (_ for _ in ()).throw(OSError("simulated directory fsync EIO")),
-    )
+    real_fsync = embedding._fsync_directory_descriptor
+    calls = 0
+
+    def fail_commit_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated directory fsync EIO")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(embedding, "_fsync_directory_descriptor", fail_commit_fsync)
 
     with pytest.raises(EmbedError, match=r"fsync|stage|EIO"):
         embed_artwork(path, artwork(), replace_existing=True)
@@ -318,6 +329,31 @@ def test_postcommit_durability_failure_rolls_back_before_backup_release(
     final = MP3(path)
     assert final.tags is not None
     assert final.tags.getall("APIC") == []
+
+
+def test_rollback_fsync_failure_is_committed_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "rollback-uncertain.mp3"
+    make_audio(path, "libmp3lame")
+    monkeypatch.setattr(
+        embedding,
+        "_fsync_directory_descriptor",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("simulated directory fsync EIO")),
+    )
+
+    with pytest.raises(EmbedCommittedError, match=r"rollback|durab|fsync") as raised:
+        embed_artwork(path, artwork(), replace_existing=True)
+
+    assert raised.value.committed is True
+    final = MP3(path)
+    assert final.tags is not None
+    assert final.tags.getall("APIC") == []
+    recovery_entries = list(tmp_path.glob(f".{path.name}.artwork-*"))
+    assert len(recovery_entries) == 1
+    recovery = MP3(recovery_entries[0])
+    assert recovery.tags is not None
+    assert recovery.tags.getall("APIC")
 
 
 def test_artwork_cache_pair_is_bound_to_requested_key(tmp_path: Path) -> None:
@@ -469,7 +505,7 @@ def test_staged_mp3_audio_payload_truncation_is_rejected_before_commit(
     path = tmp_path / "payload.mp3"
     make_audio(path, "libmp3lame", duration=5.0)
     before = path.read_bytes()
-    real_embed = apple_artwork._embed_artwork_in_place
+    real_embed = embedding._embed_artwork_in_place
 
     def truncate_after_embedding(
         temporary: int,
@@ -490,7 +526,7 @@ def test_staged_mp3_audio_payload_truncation_is_rejected_before_commit(
         os.ftruncate(temporary, id3_size + 2500)
         return result
 
-    monkeypatch.setattr(apple_artwork, "_embed_artwork_in_place", truncate_after_embedding)
+    monkeypatch.setattr(embedding, "_embed_artwork_in_place", truncate_after_embedding)
 
     with pytest.raises(EmbedError, match=r"audio|payload|metadata|preserv"):
         embed_artwork(path, artwork(), replace_existing=True)
@@ -627,7 +663,7 @@ def test_audio_directory_symlink_swap_is_rejected_before_metadata_disclosure(
     make_audio(outside, "libmp3lame", title="SECRET-OUTSIDE", album="Secret Album")
     outside_before = outside.read_bytes()
     hidden = root / "hidden-original"
-    real_discover = apple_artwork.discover_audio_files
+    real_discover = pipeline.discover_audio_files
 
     def swapping_discover(scan_root: Path) -> list[Path]:
         paths = real_discover(scan_root)
@@ -646,7 +682,7 @@ def test_audio_directory_symlink_swap_is_rejected_before_metadata_disclosure(
         def fetch(self, *_args: object, **_kwargs: object) -> Artwork:
             return artwork()
 
-    monkeypatch.setattr(apple_artwork, "discover_audio_files", swapping_discover)
+    monkeypatch.setattr(pipeline, "discover_audio_files", swapping_discover)
 
     report = process_library(
         root,
@@ -698,7 +734,7 @@ def test_commit_is_compare_and_swap_and_preserves_concurrent_metadata(
 ) -> None:
     source = tmp_path / "cas.mp3"
     make_audio(source, "libmp3lame", title="Original")
-    real_exchange = apple_artwork._rename_exchange
+    real_exchange = embedding._rename_exchange
     raced = False
 
     def racing_exchange(
@@ -716,7 +752,7 @@ def test_commit_is_compare_and_swap_and_preserves_concurrent_metadata(
             concurrent.save()
         real_exchange(first_directory, first_name, second_directory, second_name)
 
-    monkeypatch.setattr(apple_artwork, "_rename_exchange", racing_exchange)
+    monkeypatch.setattr(embedding, "_rename_exchange", racing_exchange)
 
     with pytest.raises(EmbedError, match=r"changed|concurrent|compare"):
         embed_artwork(source, artwork(), replace_existing=True)
@@ -773,7 +809,7 @@ def test_keyboard_interrupt_after_backup_release_is_explicitly_committed(
 ) -> None:
     path = tmp_path / "committed-interrupt.mp3"
     make_audio(path, "libmp3lame")
-    real_fsync = apple_artwork._fsync_directory_descriptor
+    real_fsync = embedding._fsync_directory_descriptor
     calls = 0
 
     def interrupt_second_fsync(descriptor: int) -> None:
@@ -784,7 +820,7 @@ def test_keyboard_interrupt_after_backup_release_is_explicitly_committed(
         real_fsync(descriptor)
 
     monkeypatch.setattr(
-        apple_artwork,
+        embedding,
         "_fsync_directory_descriptor",
         interrupt_second_fsync,
     )
@@ -822,7 +858,7 @@ def test_committed_interrupt_updates_report_before_propagating(
             del max_dimension, refresh
             return artwork()
 
-    real_fsync = apple_artwork._fsync_directory_descriptor
+    real_fsync = embedding._fsync_directory_descriptor
     calls = 0
 
     def interrupt_second_fsync(descriptor: int) -> None:
@@ -833,12 +869,12 @@ def test_committed_interrupt_updates_report_before_propagating(
         real_fsync(descriptor)
 
     monkeypatch.setattr(
-        apple_artwork,
+        embedding,
         "_fsync_directory_descriptor",
         interrupt_second_fsync,
     )
 
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(apple_artwork.EmbedCommittedInterrupt) as raised:
         process_library(
             root,
             client=Client(),
@@ -849,6 +885,7 @@ def test_committed_interrupt_updates_report_before_propagating(
             replace_existing=True,
         )
 
+    assert raised.value.report_persisted is True
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["status"] == "interrupted_committed"
     assert report["summary"]["files_embedded"] == 1
@@ -866,11 +903,40 @@ def test_main_reports_committed_interrupt_truthfully(
             Path("album/track.mp3"),
         )
 
-    monkeypatch.setattr(apple_artwork, "process_library", interrupted_process)
+    monkeypatch.setattr(cli, "process_library", interrupted_process)
     assert apple_artwork.main([".", "--apply", "--no-report"]) == 130
     stderr = capsys.readouterr().err
     assert "after artwork was committed" in stderr
+    assert "report records the committed state" not in stderr
+    assert "report persistence was not confirmed" in stderr
     assert "no in-progress staged file was committed" not in stderr
+
+
+def test_main_ordinary_interrupt_warns_about_prior_commits(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def interrupted_process(*_args: object, **_kwargs: object) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "process_library", interrupted_process)
+    assert apple_artwork.main([".", "--apply", "--no-report"]) == 130
+    stderr = capsys.readouterr().err
+    assert "previously completed files remain committed" in stderr
+    assert "no in-progress staged file was committed" not in stderr
+
+
+def test_main_ordinary_interrupt_without_report_avoids_false_guidance(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def interrupted_process(*_args: object, **_kwargs: object) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "process_library", interrupted_process)
+    assert apple_artwork.main([".", "--no-report"]) == 130
+    stderr = capsys.readouterr().err
+    assert "previously completed files remain committed" in stderr
+    assert "Check the in-progress report" not in stderr
+    assert "reporting was disabled" in stderr
 
 
 def test_wavpack_nonterminal_hidden_apev2_store_is_refused(tmp_path: Path) -> None:
@@ -890,6 +956,224 @@ def test_wavpack_nonterminal_hidden_apev2_store_is_refused(tmp_path: Path) -> No
         embed_artwork(path, artwork(), replace_existing=True)
 
     assert path.read_bytes() == before
+
+
+def test_wavpack_text_valued_front_art_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "text-cover.wv"
+    make_audio(path, "wavpack")
+    audio = WavPack(path)
+    if audio.tags is None:
+        audio.add_tags()
+    assert audio.tags is not None
+    audio.tags["Cover Art (Front)"] = APETextValue("name.jpg\0not-an-image")
+    audio.save()
+    before = path.read_bytes()
+
+    with pytest.raises(EmbedError, match=r"malformed|binary|front-cover"):
+        preflight_artwork(path, artwork(), replace_existing=False)
+    with pytest.raises(EmbedError, match=r"malformed|binary|front-cover"):
+        preflight_artwork(path, artwork(), replace_existing=True)
+    with pytest.raises(EmbedError, match=r"malformed|binary|front-cover"):
+        embed_artwork(path, artwork(), replace_existing=True)
+
+    assert path.read_bytes() == before
+
+
+def test_report_checkpoints_prior_commit_before_ordinary_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    first = root / "Album" / "01.flac"
+    second = root / "Album" / "02.flac"
+    report_path = root / "interrupt-report.json"
+    for path in (first, second):
+        make_audio(path, "flac", title="Song", album="Album", artist="Artist")
+
+    class Client:
+        def find_candidates(self, group: AlbumGroup) -> list[CatalogAlbum]:
+            return [candidate_for(group.logical_tracks[0])]
+
+    class Downloader:
+        def fetch(self, *_args: object, **_kwargs: object) -> Artwork:
+            return artwork()
+
+    real_embed = pipeline.embed_artwork
+    calls = 0
+
+    def interrupt_second_embed(*args: object, **kwargs: object) -> EmbedResult:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return real_embed(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "embed_artwork", interrupt_second_embed)
+    with pytest.raises(KeyboardInterrupt):
+        process_library(
+            root,
+            client=Client(),
+            downloader=Downloader(),
+            report_path=report_path,
+            allow_short_releases=True,
+            apply=True,
+            replace_existing=True,
+        )
+
+    persisted = json.loads(report_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "in_progress"
+    assert persisted["summary"]["files_embedded"] == 1
+    assert persisted["albums"][0]["file_results"][0]["path"] == str(first)
+    assert persisted["albums"][0]["file_results"][0]["status"] == "embedded"
+    assert any(picture.type == PictureType.COVER_FRONT for picture in FLAC(first).pictures)
+    assert not any(picture.type == PictureType.COVER_FRONT for picture in FLAC(second).pictures)
+
+
+def test_report_write_failure_after_commit_is_classified_truthfully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    path = root / "Album" / "track.flac"
+    report_path = root / "report.json"
+    make_audio(path, "flac", title="Song", album="Album", artist="Artist")
+
+    class Client:
+        def find_candidates(self, group: AlbumGroup) -> list[CatalogAlbum]:
+            return [candidate_for(group.logical_tracks[0])]
+
+    class Downloader:
+        def fetch(self, *_args: object, **_kwargs: object) -> Artwork:
+            return artwork()
+
+    real_write = pipeline._write_json_report
+
+    def fail_after_commit(
+        destination: Path,
+        payload: dict[str, object],
+        *,
+        overwrite: bool,
+    ) -> None:
+        summary = payload.get("summary")
+        if isinstance(summary, dict) and summary.get("files_embedded") == 1:
+            raise OSError(5, "simulated report I/O failure")
+        real_write(destination, payload, overwrite=overwrite)
+
+    monkeypatch.setattr(pipeline, "_write_json_report", fail_after_commit)
+    with pytest.raises(Exception) as raised:
+        process_library(
+            root,
+            client=Client(),
+            downloader=Downloader(),
+            report_path=report_path,
+            allow_short_releases=True,
+            apply=True,
+            replace_existing=True,
+        )
+
+    assert getattr(raised.value, "committed", False) is True
+    assert "report" in str(raised.value).casefold()
+    assert "committed" in str(raised.value).casefold()
+    assert any(picture.type == PictureType.COVER_FRONT for picture in FLAC(path).pictures)
+
+
+def test_final_report_failure_retains_applied_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    path = root / "Album" / "track.flac"
+    report_path = root / "report.json"
+    make_audio(path, "flac", title="Song", album="Album", artist="Artist")
+
+    class Client:
+        def find_candidates(self, group: AlbumGroup) -> list[CatalogAlbum]:
+            return [candidate_for(group.logical_tracks[0])]
+
+    class Downloader:
+        def fetch(self, *_args: object, **_kwargs: object) -> Artwork:
+            return artwork()
+
+    real_write = pipeline._write_json_report
+
+    def fail_final(
+        destination: Path,
+        payload: dict[str, object],
+        *,
+        overwrite: bool,
+    ) -> None:
+        if payload.get("status") == "complete":
+            raise OSError(5, "simulated final report I/O failure")
+        real_write(destination, payload, overwrite=overwrite)
+
+    monkeypatch.setattr(pipeline, "_write_json_report", fail_final)
+    with pytest.raises(Exception) as raised:
+        process_library(
+            root,
+            client=Client(),
+            downloader=Downloader(),
+            report_path=report_path,
+            allow_short_releases=True,
+            apply=True,
+            replace_existing=True,
+        )
+
+    assert getattr(raised.value, "committed", False) is True
+    persisted = json.loads(report_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "in_progress"
+    assert persisted["summary"]["files_embedded"] == 1
+    assert persisted["albums"][0]["status"] == "applied"
+    assert persisted["albums"][0]["file_results"][0]["status"] == "embedded"
+
+
+def test_interrupt_during_committed_checkpoint_is_classified_truthfully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    path = root / "Album" / "track.flac"
+    report_path = root / "report.json"
+    make_audio(path, "flac", title="Track", album="Album", artist="Artist")
+    local_track = apple_artwork.read_track_metadata(path)
+    assert local_track is not None
+    group = apple_artwork.group_tracks([local_track])[0]
+    candidate = candidate_for(group.logical_tracks[0])
+
+    class Client:
+        def find_candidates(self, _group: object) -> list[CatalogAlbum]:
+            return [candidate]
+
+    class Downloader:
+        def fetch(self, *_args: object, **_kwargs: object) -> Artwork:
+            return artwork()
+
+    real_write = pipeline._write_json_report
+
+    def interrupt_committed_checkpoint(
+        destination: Path,
+        payload: dict[str, object],
+        *,
+        overwrite: bool,
+    ) -> None:
+        summary = payload.get("summary")
+        if isinstance(summary, dict) and summary.get("files_embedded") == 1:
+            raise KeyboardInterrupt
+        real_write(destination, payload, overwrite=overwrite)
+
+    monkeypatch.setattr(pipeline, "_write_json_report", interrupt_committed_checkpoint)
+    with pytest.raises(apple_artwork.EmbedCommittedInterrupt) as raised:
+        process_library(
+            root,
+            client=Client(),
+            downloader=Downloader(),
+            report_path=report_path,
+            allow_short_releases=True,
+            apply=True,
+            replace_existing=True,
+        )
+
+    assert raised.value.report_persisted is False
+    assert raised.value.path == path
+    assert FLAC(path).pictures
+    stale = json.loads(report_path.read_text(encoding="utf-8"))
+    assert stale["summary"] == {}
+    assert stale["albums"] == []
 
 
 def test_dependency_floors_exclude_reviewed_vulnerable_versions() -> None:
