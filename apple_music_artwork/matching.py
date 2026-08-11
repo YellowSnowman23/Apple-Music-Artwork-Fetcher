@@ -150,6 +150,12 @@ def _title_similarity(left: str, right: str) -> float:
     )
 
 
+def _canonical_track_identity(value: str) -> str:
+    value = _without_trailing_album_version(value)
+    normalized = normalize_text(value)
+    return re.split(r"\b(?:feat|featuring|ft)\b", normalized, maxsplit=1)[0].strip()
+
+
 _TRAILING_REMASTER = re.compile(
     r"\s*[\[(]\s*(?P<label>"
     r"(?:(?:18|19|20|21)\d{2}\s+)?"
@@ -292,6 +298,158 @@ def _duration_similarity(left_ms: int | None, right_ms: int | None) -> float:
     return 1.0 - 0.2 * (difference / tolerance)
 
 
+_TRAILING_RELEASE_EDITION = re.compile(
+    r"\s*[\[(]\s*(?:expanded|deluxe)(?:\s+edition)?\s*[\])]\s*$",
+    flags=re.IGNORECASE,
+)
+
+_TRAILING_ALBUM_NICKNAME = re.compile(
+    r"\s*[\[(]\s*(?:the\s+)?(?:[\w'-]+\s+){0,3}album\s*[\])]\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_track_release_label(value: str) -> tuple[str, bool]:
+    """Remove only trailing mastering labels that do not change a song's identity."""
+    changed = False
+    while True:
+        without_album_version = _without_trailing_album_version(value)
+        if without_album_version != value:
+            value = without_album_version
+            changed = True
+            continue
+        remaster = _split_trailing_remaster(value)
+        if remaster is not None:
+            value = remaster[0]
+            changed = True
+            continue
+        return value, changed
+
+
+def _strip_album_release_label(value: str) -> tuple[str, bool]:
+    """Remove release packaging labels while preserving semantic edition words."""
+    changed = False
+    stripped = value.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        stripped = stripped[1:-1].strip()
+        changed = True
+    while True:
+        without_album_version = _without_trailing_album_version(stripped)
+        if without_album_version != stripped:
+            stripped = without_album_version
+            changed = True
+            continue
+        remaster = _split_trailing_remaster(stripped)
+        if remaster is not None:
+            stripped = remaster[0]
+            changed = True
+            continue
+        without_edition = _TRAILING_RELEASE_EDITION.sub("", stripped).rstrip()
+        if without_edition != stripped:
+            stripped = without_edition
+            changed = True
+            continue
+        return stripped, changed
+
+
+def _semantic_qualifiers(value: str) -> frozenset[str]:
+    return frozenset(
+        qualifier
+        for qualifier in _version_qualifiers(value)
+        if qualifier not in {"remaster", "expanded", "deluxe"}
+        and not qualifier.startswith("remaster:")
+    )
+
+
+def _explicit_remaster_years_conflict(left: str, right: str) -> bool:
+    left_years = {
+        qualifier for qualifier in _version_qualifiers(left) if qualifier.startswith("remaster:")
+    }
+    right_years = {
+        qualifier for qualifier in _version_qualifiers(right) if qualifier.startswith("remaster:")
+    }
+    return bool(left_years and right_years and left_years != right_years)
+
+
+def _release_album_names_related(left: str, right: str) -> tuple[bool, bool]:
+    left_base, left_changed = _strip_album_release_label(left)
+    right_base, right_changed = _strip_album_release_label(right)
+    left_n = normalize_text(left_base)
+    right_n = normalize_text(right_base)
+    if not left_n or not right_n:
+        return False, False
+    related = left_n == right_n
+    nickname_equivalent = False
+    if not related:
+        for titled, other in ((left_base, right_base), (right_base, left_base)):
+            nickname = _TRAILING_ALBUM_NICKNAME.search(titled)
+            if nickname is not None and normalize_text(
+                titled[: nickname.start()]
+            ) == normalize_text(other):
+                related = True
+                nickname_equivalent = True
+                break
+    return related, left_changed or right_changed or nickname_equivalent
+
+
+def _aligned_release_label_positions(
+    group: AlbumGroup,
+    candidate: CatalogAlbum,
+) -> frozenset[tuple[int, int]]:
+    """Prove release identity before reconciling cross-provider mastering labels."""
+    local_tracks = group.logical_tracks
+    remote_tracks = candidate.tracks
+    if (
+        len(local_tracks) < 5
+        or len(local_tracks) != len(remote_tracks)
+        or candidate.track_count != len(remote_tracks)
+        or _local_tracklist_incomplete(group)
+        or not _artists_equivalent(group.album_artist, candidate.artist)
+        or _semantic_qualifiers(group.album) != _semantic_qualifiers(candidate.album)
+        or _explicit_remaster_years_conflict(group.album, candidate.album)
+    ):
+        return frozenset()
+    local_positions = _complete_positions(local_tracks)
+    remote_positions = _complete_positions(remote_tracks)
+    if local_positions is None or local_positions != remote_positions:
+        return frozenset()
+    album_related, label_evidence = _release_album_names_related(group.album, candidate.album)
+    if not album_related:
+        return frozenset()
+
+    remote_by_position = {
+        (track.disc_number or 1, track.track_number): track for track in remote_tracks
+    }
+    compatible_durations = 0
+    for local in local_tracks:
+        assert local.track_number is not None
+        position = (local.disc_number or 1, local.track_number)
+        remote = remote_by_position[position]
+        if not _artists_equivalent(local.artist, remote.artist):
+            return frozenset()
+        if _explicit_remaster_years_conflict(local.title, remote.title):
+            return frozenset()
+        local_base, local_changed = _strip_track_release_label(local.title)
+        remote_base, remote_changed = _strip_track_release_label(remote.title)
+        label_evidence = label_evidence or local_changed or remote_changed
+        if normalize_text(local_base) != normalize_text(remote_base):
+            return frozenset()
+        if _semantic_qualifiers(local_base) != _semantic_qualifiers(remote_base):
+            return frozenset()
+        if local.duration_ms is None or remote.duration_ms is None:
+            return frozenset()
+        if _duration_similarity(local.duration_ms, remote.duration_ms) > 0:
+            compatible_durations += 1
+            continue
+        difference = abs(local.duration_ms - remote.duration_ms)
+        maximum_drift = max(10_000.0, max(local.duration_ms, remote.duration_ms) * 0.03)
+        if difference > maximum_drift:
+            return frozenset()
+    if not label_evidence or compatible_durations < math.ceil(0.85 * len(local_tracks)):
+        return frozenset()
+    return frozenset(local_positions)
+
+
 def _position_similarity(local: TrackMetadata, remote: CatalogTrack) -> float:
     known = 0
     matched = 0
@@ -306,7 +464,10 @@ def _position_similarity(local: TrackMetadata, remote: CatalogTrack) -> float:
 
 
 def _match_tracks(
-    local_tracks: tuple[TrackMetadata, ...], remote_tracks: tuple[CatalogTrack, ...]
+    local_tracks: tuple[TrackMetadata, ...],
+    remote_tracks: tuple[CatalogTrack, ...],
+    *,
+    aligned_release_positions: frozenset[tuple[int, int]] = frozenset(),
 ) -> list[tuple[TrackMetadata, CatalogTrack, float, float, float]]:
     strip_local_remaster, strip_remote_remaster = _provider_omitted_uniform_remaster(
         local_tracks, remote_tracks
@@ -321,6 +482,12 @@ def _match_tracks(
             remote_title = remote.title
             local_position = (local.disc_number or 1, local.track_number)
             remote_position = (remote.disc_number or 1, remote.track_number)
+            aligned_release_pair = (
+                local_position == remote_position and local_position in aligned_release_positions
+            )
+            if aligned_release_pair:
+                local_title = _strip_track_release_label(local_title)[0]
+                remote_title = _strip_track_release_label(remote_title)[0]
             if (
                 local_position == remote_position
                 and local_position in strip_local_instrumental_positions
@@ -328,22 +495,27 @@ def _match_tracks(
                 parsed_local_instrumental = _split_trailing_instrumental_album_version(local_title)
                 assert parsed_local_instrumental is not None
                 local_title = parsed_local_instrumental
-            if strip_local_remaster:
+            if strip_local_remaster and not aligned_release_pair:
                 parsed_local = _split_trailing_remaster(local_title)
                 assert parsed_local is not None
                 local_title = parsed_local[0]
-            if strip_remote_remaster:
+            if strip_remote_remaster and not aligned_release_pair:
                 parsed_remote = _split_trailing_remaster(remote_title)
                 assert parsed_remote is not None
                 remote_title = parsed_remote[0]
             title_score = _title_similarity(local_title, remote_title)
             duration_score = _duration_similarity(local.duration_ms, remote.duration_ms)
+            if local_position == remote_position and _canonical_track_identity(
+                local_title
+            ) != _canonical_track_identity(remote_title):
+                continue
             if title_score < 0.93 or _has_version_conflict(local_title, remote_title):
                 continue
             if (
                 local.duration_ms is not None
                 and remote.duration_ms is not None
                 and duration_score == 0
+                and not aligned_release_pair
             ):
                 continue
             position_score = _position_similarity(local, remote)
@@ -453,9 +625,14 @@ def score_candidate(
     allow_short_releases: bool = False,
 ) -> CandidateScore:
     """Score a candidate with hard identity and tracklist gates before fuzzy ranking."""
+    aligned_release_positions = _aligned_release_label_positions(group, candidate)
     album_score = text_similarity(group.album, candidate.album)
     artist_score = text_similarity(group.album_artist, candidate.artist)
-    matches = _match_tracks(group.logical_tracks, candidate.tracks)
+    matches = _match_tracks(
+        group.logical_tracks,
+        candidate.tracks,
+        aligned_release_positions=aligned_release_positions,
+    )
     local_count = len(group.logical_tracks)
     remote_song_count = len(candidate.tracks)
     remote_count = candidate.track_count or remote_song_count
@@ -480,6 +657,9 @@ def score_candidate(
         year_score = 0.5
     else:
         year_score = max(0.0, 1.0 - abs(group.year - candidate.release_year) / 5)
+    if aligned_release_positions:
+        album_score = max(album_score, 0.95)
+        year_score = max(year_score, 0.5)
 
     reasons: list[str] = []
     local_incomplete = _local_tracklist_incomplete(group)
@@ -487,31 +667,36 @@ def score_candidate(
         reasons.append("local tracklist appears incomplete")
     if remote_count != remote_song_count:
         reasons.append("Apple tracklist appears incomplete")
-    local_positions = tuple(
-        sorted(
-            (track.disc_number, track.track_number)
-            for track in group.logical_tracks
-            if track.disc_number is not None and track.track_number is not None
-        )
-    )
-    remote_positions = tuple(
-        sorted(
-            (track.disc_number, track.track_number)
-            for track in candidate.tracks
-            if track.disc_number is not None and track.track_number is not None
-        )
-    )
+    local_positions = _complete_positions(group.logical_tracks)
+    remote_positions = _complete_positions(candidate.tracks)
     if (
         not local_incomplete
-        and len(local_positions) == local_count
-        and len(remote_positions) == remote_song_count
+        and local_positions is not None
+        and remote_positions is not None
         and local_positions != remote_positions
     ):
         reasons.append("disc/track topology mismatch")
-    if _has_version_conflict(group.album, candidate.album):
+    if matches and any(match[4] < 1.0 for match in matches):
+        reasons.append("track order mismatch")
+    position_maps_equal = (
+        not local_incomplete
+        and local_positions is not None
+        and remote_positions is not None
+        and local_positions == remote_positions
+    )
+    if position_maps_equal and (
+        len(matches) != local_count or any(match[4] < 1.0 for match in matches)
+    ):
+        reasons.append("positioned tracklist mismatch")
+    if _has_version_conflict(group.album, candidate.album) and not aligned_release_positions:
         reasons.append("edition/version conflict")
     if album_score < 0.72:
         reasons.append("album mismatch")
+    album_names_related, _album_label_evidence = _release_album_names_related(
+        group.album, candidate.album
+    )
+    if not album_names_related:
+        reasons.append("album title mismatch")
     if not _artists_equivalent(group.album_artist, candidate.artist):
         reasons.append("artist mismatch")
     if matches and track_artist_score < 1.0:
@@ -524,6 +709,8 @@ def score_candidate(
     local_barcode = _normalize_barcode(group.barcode)
     verified_barcode = _normalize_barcode(candidate.verified_barcode)
     identifier_verified = bool(local_barcode and local_barcode == verified_barcode)
+    if local_barcode and verified_barcode and local_barcode != verified_barcode:
+        reasons.append("barcode mismatch")
     if len(matches) < 3 and not identifier_verified and not allow_short_releases:
         reasons.append("fewer than three strong tracks")
     if coverage < 0.85:
@@ -561,6 +748,69 @@ def score_candidate(
     )
 
 
+def _equivalent_catalog_releases(left: CatalogAlbum, right: CatalogAlbum) -> bool:
+    if (
+        normalize_text(left.album) != normalize_text(right.album)
+        or not _artists_equivalent(left.artist, right.artist)
+        or left.release_year != right.release_year
+        or left.track_count != right.track_count
+        or _version_qualifiers(left.album) != _version_qualifiers(right.album)
+    ):
+        return False
+    left_positions = _complete_positions(left.tracks)
+    right_positions = _complete_positions(right.tracks)
+    if left_positions is None or left_positions != right_positions:
+        return False
+    right_by_position = {
+        (track.disc_number or 1, track.track_number): track for track in right.tracks
+    }
+    for left_track in left.tracks:
+        position = (left_track.disc_number or 1, left_track.track_number)
+        right_track = right_by_position[position]
+        if (
+            normalize_text(left_track.title) != normalize_text(right_track.title)
+            or not _artists_equivalent(left_track.artist, right_track.artist)
+            or _has_version_conflict(left_track.title, right_track.title)
+            or left_track.duration_ms is None
+            or right_track.duration_ms is None
+            or _duration_similarity(left_track.duration_ms, right_track.duration_ms) == 0
+        ):
+            return False
+    return True
+
+
+def _aggregate_duration_distance(group: AlbumGroup, candidate: CatalogAlbum) -> int | None:
+    local_positions = _complete_positions(group.logical_tracks)
+    remote_positions = _complete_positions(candidate.tracks)
+    if local_positions is None or local_positions != remote_positions:
+        return None
+    remote_by_position = {
+        (track.disc_number or 1, track.track_number): track for track in candidate.tracks
+    }
+    distance = 0
+    for local in group.logical_tracks:
+        assert local.track_number is not None
+        remote = remote_by_position[(local.disc_number or 1, local.track_number)]
+        if local.duration_ms is None or remote.duration_ms is None:
+            return None
+        distance += abs(local.duration_ms - remote.duration_ms)
+    return distance
+
+
+def _duration_fingerprint_breaks_tie(
+    group: AlbumGroup,
+    best: CandidateScore,
+    runner: CandidateScore,
+) -> bool:
+    if not _equivalent_catalog_releases(best.candidate, runner.candidate):
+        return False
+    best_distance = _aggregate_duration_distance(group, best.candidate)
+    runner_distance = _aggregate_duration_distance(group, runner.candidate)
+    if best_distance is None or runner_distance is None:
+        return False
+    return best_distance + 100 <= runner_distance and best_distance <= runner_distance * 0.90
+
+
 def choose_match(
     group: AlbumGroup,
     candidates: Iterable[CatalogAlbum],
@@ -588,14 +838,28 @@ def choose_match(
         return MatchDecision(
             "no_match", None, scores, "no candidate passed identity and tracklist gates"
         )
+    local_barcode = _normalize_barcode(group.barcode)
+    if local_barcode is not None:
+        identifier_verified = [
+            score
+            for score in eligible
+            if _normalize_barcode(score.candidate.verified_barcode) == local_barcode
+        ]
+        if identifier_verified:
+            eligible = identifier_verified
     best = eligible[0]
     if best.total < min_score:
         return MatchDecision(
             "low_confidence", None, scores, f"best score {best.total:.3f} is below {min_score:.3f}"
         )
     if len(eligible) > 1:
-        margin = best.total - eligible[1].total
-        if margin < min_margin:
+        close_runners = [
+            runner for runner in eligible[1:] if best.total - runner.total < min_margin
+        ]
+        if close_runners and not all(
+            _duration_fingerprint_breaks_tie(group, best, runner) for runner in close_runners
+        ):
+            margin = best.total - eligible[1].total
             return MatchDecision(
                 "ambiguous",
                 None,

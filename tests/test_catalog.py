@@ -6,6 +6,7 @@ from apple_artwork import (
     AppleCatalogClient,
     TrackMetadata,
     candidate_ids_from_album_search,
+    candidate_ids_from_song_search,
     catalog_albums_from_lookup,
 )
 
@@ -76,6 +77,85 @@ def test_album_search_candidates_apply_an_artist_gate_before_lookup() -> None:
     ]
 
     assert candidate_ids_from_album_search(rows, "Alpha", "Greatest Hits") == [2]
+
+
+def test_album_search_keeps_exact_artist_equal_count_edition_candidate() -> None:
+    rows = [
+        {
+            "collectionId": 1873373091,
+            "collectionName": "5150 (Expanded Edition)",
+            "artistName": "Van Halen",
+            "trackCount": 30,
+            "artworkUrl100": "https://example.invalid/5150.jpg",
+        }
+    ]
+
+    assert candidate_ids_from_album_search(
+        rows,
+        "Van Halen",
+        "5150",
+        track_count=30,
+    ) == [1873373091]
+
+
+def test_song_search_accepts_provider_omitted_local_remaster_for_discovery() -> None:
+    rows = [
+        {
+            "wrapperType": "track",
+            "kind": "song",
+            "collectionId": 976835132,
+            "collectionName": "Fair Warning",
+            "trackName": "Mean Street",
+            "artistName": "Van Halen",
+        }
+    ]
+
+    assert candidate_ids_from_song_search(
+        rows,
+        artist="Van Halen",
+        album="Fair Warning",
+        title="Mean Street (2015 Remaster)",
+    ) == [976835132]
+
+
+def test_song_search_can_discover_provider_explicit_remaster_for_full_validation() -> None:
+    rows = [
+        {
+            "wrapperType": "track",
+            "kind": "song",
+            "collectionId": 976835132,
+            "collectionName": "Fair Warning",
+            "trackName": "Mean Street (2015 Remaster)",
+            "artistName": "Van Halen",
+        }
+    ]
+
+    assert candidate_ids_from_song_search(
+        rows,
+        artist="Van Halen",
+        album="Fair Warning",
+        title="Mean Street",
+    ) == [976835132]
+
+
+def test_song_search_reconciles_album_version_and_remaster_for_discovery() -> None:
+    rows = [
+        {
+            "wrapperType": "track",
+            "kind": "song",
+            "collectionId": 1890580956,
+            "collectionName": "Weezer (2024 Remaster)",
+            "trackName": "My Name Is Jonas (2024 Remaster)",
+            "artistName": "Weezer",
+        }
+    ]
+
+    assert candidate_ids_from_song_search(
+        rows,
+        artist="Weezer",
+        album="Weezer (The Blue Album)",
+        title="My Name Is Jonas (Album Version)",
+    ) == [1890580956]
 
 
 class FakeResponse:
@@ -281,7 +361,7 @@ def test_catalog_client_falls_back_to_a_distinctive_song_when_album_search_misse
     )
     track = TrackMetadata(
         Path("song.flac"),
-        "15 Step",
+        "15 Step (Album Version)",
         "Radiohead",
         "In Rainbows",
         "Radiohead",
@@ -301,3 +381,4 @@ def test_catalog_client_falls_back_to_a_distinctive_song_when_album_search_misse
     assert len(session.calls) == 3
     assert session.calls[1][1]["entity"] == "song"
     assert "15 Step" in str(session.calls[1][1]["term"])
+    assert "Album Version" not in str(session.calls[1][1]["term"])

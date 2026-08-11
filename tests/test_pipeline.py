@@ -199,6 +199,8 @@ def test_process_library_verbose_emits_progress_and_candidate_diagnostics(
                 "00 AF-AFZ/01.flac",
                 "Artist/00 DCC-GZS/02.flac",
                 "Artist/Album/00 Intro.flac",
+                "Artist/DCC Gold/03.flac",
+                "Artist/GZS-1001/04.flac",
             ],
         ),
     ],
@@ -213,6 +215,8 @@ def test_process_library_omits_00_folders_unless_apply_dcc_is_enabled(
     paths = [
         root / "00 AF-AFZ" / "01.flac",
         root / "Artist" / "00 DCC-GZS" / "02.flac",
+        root / "Artist" / "DCC Gold" / "03.flac",
+        root / "Artist" / "GZS-1001" / "04.flac",
         root / "Artist" / "Album" / "00 Intro.flac",
     ]
     for path in paths:
@@ -237,9 +241,9 @@ def test_process_library_omits_00_folders_unless_apply_dcc_is_enabled(
         emit=lambda _message: None,
     )
 
-    assert report["summary"]["discovered_files"] == 3
+    assert report["summary"]["discovered_files"] == 5
     assert report["summary"]["selected_files"] == len(expected_relative)
-    assert report["summary"]["dcc_omitted_files"] == (0 if apply_dcc else 2)
+    assert report["summary"]["dcc_omitted_files"] == (0 if apply_dcc else 4)
     assert [path.relative_to(root).as_posix() for path in inspected] == expected_relative
 
 

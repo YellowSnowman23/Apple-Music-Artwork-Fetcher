@@ -19,6 +19,7 @@ from .constants import (
     MAX_ARTWORK_BYTES,
     MAX_IMAGE_PIXELS,
     MIN_ARTWORK_DIMENSION,
+    USER_AGENT,
 )
 from .filesystem import _atomic_write_bytes, _read_secure_file
 from .models import Artwork, ArtworkError
@@ -212,7 +213,7 @@ class ArtworkDownloader:
             headers.update(
                 {
                     "Accept": "image/png,image/jpeg",
-                    "User-Agent": "AppleMusicArtworkEmbedder/2.0 (+local library tool)",
+                    "User-Agent": USER_AGENT,
                 }
             )
         self.timeout = max(1.0, float(timeout))

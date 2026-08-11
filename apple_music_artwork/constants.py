@@ -2,7 +2,8 @@
 
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
-VERSION = "2.1.5"
+VERSION = "2.5.0"
+USER_AGENT = f"AppleMusicArtworkEmbedder/{VERSION} (+local library tool)"
 
 MAX_ARTWORK_BYTES = 128 * 1024 * 1024
 MAX_API_BYTES = 8 * 1024 * 1024

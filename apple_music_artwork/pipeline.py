@@ -135,9 +135,18 @@ def process_library(
     dcc_omitted_files = 0
     for path in discovered:
         relative_path = path.relative_to(root)
-        if not apply_dcc and any(part.startswith("00") for part in relative_path.parts[:-1]):
+        protected_prefix = next(
+            (
+                prefix.upper()
+                for part in relative_path.parts[:-1]
+                for prefix in ("00", "dcc", "gzs")
+                if part.casefold().startswith(prefix)
+            ),
+            None,
+        )
+        if not apply_dcc and protected_prefix is not None:
             dcc_omitted_files += 1
-            detail(f"OMIT-00 {relative_path.as_posix()}")
+            detail(f"OMIT-{protected_prefix} {relative_path.as_posix()}")
             continue
         relative = relative_path.as_posix()
         if include_patterns and not any(

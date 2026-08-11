@@ -13,11 +13,13 @@ from pathlib import Path
 
 import requests
 
-from .constants import ITUNES_LOOKUP_URL, ITUNES_SEARCH_URL, MAX_API_BYTES
+from .constants import ITUNES_LOOKUP_URL, ITUNES_SEARCH_URL, MAX_API_BYTES, USER_AGENT
 from .filesystem import _atomic_write_bytes, _read_secure_file
 from .matching import (
     _artists_equivalent,
     _normalize_barcode,
+    _split_trailing_remaster,
+    _without_trailing_album_version,
     normalize_text,
     score_candidate,
     text_similarity,
@@ -45,6 +47,7 @@ def candidate_ids_from_album_search(
     artist: str,
     album: str,
     *,
+    track_count: int | None = None,
     limit: int = 12,
 ) -> list[int]:
     ranked: list[tuple[float, int]] = []
@@ -56,11 +59,20 @@ def candidate_ids_from_album_search(
         row_artist = str(row.get("collectionArtistName") or row.get("artistName") or "")
         album_score = text_similarity(album, row_album)
         artist_score = text_similarity(artist, row_artist)
-        if album_score < 0.62 or not _artists_equivalent(artist, row_artist):
+        exact_count = track_count is not None and _as_int(row.get("trackCount")) == track_count
+        if not _artists_equivalent(artist, row_artist) or (album_score < 0.62 and not exact_count):
             continue
-        ranked.append((0.62 * album_score + 0.38 * artist_score, collection_id))
+        ranked.append(
+            (0.57 * album_score + 0.38 * artist_score + 0.05 * float(exact_count), collection_id)
+        )
     ranked.sort(key=lambda item: item[0], reverse=True)
     return list(dict.fromkeys(collection_id for _, collection_id in ranked[:limit]))
+
+
+def _search_title_base(value: str) -> str:
+    value = _without_trailing_album_version(value)
+    remaster = _split_trailing_remaster(value)
+    return remaster[0] if remaster is not None else value
 
 
 def candidate_ids_from_song_search(
@@ -70,16 +82,25 @@ def candidate_ids_from_song_search(
     album: str,
     title: str,
 ) -> list[int]:
+    comparison_title = _search_title_base(title)
     ranked: list[tuple[float, int]] = []
     for row in rows:
         collection_id = _as_int(row.get("collectionId"))
         if collection_id is None or row.get("kind") != "song":
             continue
-        title_score = text_similarity(title, str(row.get("trackName") or ""))
+        title_score = text_similarity(
+            comparison_title,
+            _search_title_base(str(row.get("trackName") or "")),
+        )
         row_artist = str(row.get("artistName") or "")
         artist_score = text_similarity(artist, row_artist)
         album_score = text_similarity(album, str(row.get("collectionName") or ""))
-        if title_score < 0.78 or not _artists_equivalent(artist, row_artist) or album_score < 0.50:
+        exact_title = title_score == 1.0
+        if (
+            title_score < 0.78
+            or not _artists_equivalent(artist, row_artist)
+            or (album_score < 0.50 and not exact_title)
+        ):
             continue
         ranked.append(
             (0.46 * title_score + 0.34 * artist_score + 0.20 * album_score, collection_id)
@@ -192,7 +213,7 @@ class AppleCatalogClient:
             headers.update(
                 {
                     "Accept": "application/json",
-                    "User-Agent": "AppleMusicArtworkEmbedder/2.0 (+local library tool)",
+                    "User-Agent": USER_AGENT,
                 }
             )
         self.timeout = max(1.0, float(timeout))
@@ -377,7 +398,7 @@ class AppleCatalogClient:
             song_rows = self._request_results(
                 ITUNES_SEARCH_URL,
                 {
-                    "term": f"{group.album_artist} {anchor.title}",
+                    "term": f"{group.album_artist} {_search_title_base(anchor.title)}",
                     "country": self.country,
                     "media": "music",
                     "entity": "song",
@@ -424,7 +445,10 @@ class AppleCatalogClient:
             },
         )
         collection_ids = candidate_ids_from_album_search(
-            search_rows, group.album_artist, group.album
+            search_rows,
+            group.album_artist,
+            group.album,
+            track_count=len(group.logical_tracks),
         )
         albums = self._lookup_collection_ids(collection_ids) if collection_ids else []
         has_verified_tracklist = any(

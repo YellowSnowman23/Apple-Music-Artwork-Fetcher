@@ -6,6 +6,9 @@ import apple_artwork
 import apple_music_artwork
 from apple_music_artwork.adapters import ADAPTERS
 from apple_music_artwork.adapters.base import FormatAdapter
+from apple_music_artwork.artwork import ArtworkDownloader
+from apple_music_artwork.catalog import AppleCatalogClient
+from apple_music_artwork.constants import VERSION
 
 MODULES = (
     "artwork",
@@ -57,3 +60,19 @@ def test_package_never_imports_legacy_facade() -> None:
             elif isinstance(node, ast.ImportFrom) and node.module == "apple_artwork":
                 offenders.append(str(source_path))
     assert not offenders
+
+
+def test_network_clients_identify_current_release(tmp_path: Path) -> None:
+    class Session:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+    catalog_session = Session()
+    artwork_session = Session()
+
+    AppleCatalogClient(cache_dir=tmp_path, session=catalog_session)
+    ArtworkDownloader(cache_dir=tmp_path, session=artwork_session)
+
+    expected = f"AppleMusicArtworkEmbedder/{VERSION} (+local library tool)"
+    assert catalog_session.headers["User-Agent"] == expected
+    assert artwork_session.headers["User-Agent"] == expected

@@ -95,7 +95,7 @@ Download the wheel attached to the corresponding [GitHub release][releases], the
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "/path/to/apple_music_artwork_embedder-2.1.5-py3-none-any.whl"
+python -m pip install "/path/to/apple_music_artwork_embedder-2.5.0-py3-none-any.whl"
 apple-artwork --version
 ```
 
@@ -178,9 +178,9 @@ apple-artwork "/path/to/Music" \
 
 `--replace-existing` requires `--apply`. It cannot accidentally turn a dry run into a write.
 
-## Special-edition folders beginning with `00`
+## Protected special-mastering folders
 
-Files beneath any relative folder component whose name starts with `00` are omitted by default. This protects special-mastering collections whose artwork should not be replaced with an ordinary Apple edition.
+Files beneath any relative folder component whose name starts with `00`, `DCC`, or `GZS` (case-insensitive) are omitted by default. This protects special-mastering collections whose artwork should not be replaced with an ordinary Apple edition.
 
 The scanner applies this rule before reading embedded tags or making Apple requests.
 
@@ -190,9 +190,11 @@ Examples skipped by default:
 Music/00 AF-AFZ/...
 Music/00 DCC-GZS/...
 Music/Artist/00 Special Edition/...
+Music/Artist/DCC Gold/...
+Music/Artist/GZS-1001/...
 ```
 
-A filename such as `00 Intro.flac` is not omitted. The selected root's own name also does not trigger the rule.
+A filename such as `00 Intro.flac` or `DCC Track.flac` is not omitted. The selected root's own name also does not trigger the rule.
 
 Use `--apply-dcc` to include those directories deliberately:
 
@@ -209,7 +211,7 @@ apple-artwork "/path/to/Music" \
   -v
 ```
 
-Despite the name, `--apply-dcc` does not enable `--apply`.
+`--apply-dcc` is the backward-compatible override for all three protected prefixes. Despite the name, it does not enable `--apply`.
 
 ## Verbose output
 
@@ -217,7 +219,7 @@ Despite the name, `--apply-dcc` does not enable `--apply`.
 
 - scan mode, root, country, and DCC policy;
 - discovery and omission counts;
-- paths omitted by `00`, `--include`, or `--exclude` rules;
+- paths omitted by the `00`/`DCC`/`GZS`, `--include`, or `--exclude` rules;
 - local metadata-adapter preflight;
 - album grouping;
 - Apple candidate IDs, scores, eligibility, and rejection reasons;
@@ -247,27 +249,27 @@ Discovery silently omits symlinked files, hard-linked files, dot-prefixed filena
 Candidate discovery runs in this order:
 
 1. Exact numeric UPC lookup when a barcode is embedded.
-2. Album search using album artist and album title.
-3. Distinctive-song fallback when album search finds no gated candidate.
+2. Album search using album artist and album title. An exact artist plus equal declared track count may keep an edition-labeled result for full validation even when its raw album-title score is low.
+3. Distinctive-song fallback when album search finds no gated candidate. Search-only comparison removes trailing `Album Version` and remaster labels from either side so harmless provider wording cannot hide a candidate.
 4. Apple Lookup expansion of collection IDs into song rows.
 
 A candidate must then pass the release and tracklist gates:
 
 - Artist identity is mandatory.
-- The hard edition gate recognizes: deluxe, expanded, anniversary, special edition, collector's edition, extended, soundtrack, live, mono, stereo, acoustic, instrumental, radio edit, drumless, demo, bonus, remaster, and remix. Conflicting recognized qualifier sets are rejected.
+- The hard edition gate recognizes: deluxe, expanded, anniversary, special edition, collector's edition, extended, soundtrack, live, mono, stereo, acoustic, instrumental, radio edit, drumless, demo, bonus, remaster, and remix. Conflicting recognized qualifier sets are normally rejected.
 - Other edition wording is handled only by title similarity; it does not trigger a categorical edition rejection. Inspect unusual labels carefully in the dry-run report.
 - A trailing bracketed `Album Version` annotation is treated as neutral for track-title comparison.
-- A provider-omitted trailing remaster annotation is neutral only when every local track applies the same annotation, every provider track omits it, at least three tracks are present, track counts and full disc/track topology agree, and every position-aligned stripped local title is canonically identical to the provider title with a known, compatible duration. This exception is intentionally one-way: an explicit provider remaster label is never stripped to match unqualified local tags. Artist, coverage, album-edition, score, and ambiguity gates still apply.
+- Cross-provider `Album Version`, remaster, expanded, and deluxe packaging labels may be reconciled in either direction only after strong release-level proof: at least five tracks, a complete equal-count local and Apple release, identical full disc/track topology, exact album-artist and per-track artist identity, related album names after packaging-label normalization, and position-aligned base song identity throughout. Every duration must be known; at least 85% must pass the normal duration tolerance, and any remaining mastering drift is capped at 10 seconds or 3%. Live, remix, acoustic, radio edit, instrumental, mono, stereo, demo, and other semantic differences still block this path.
 - A trailing local `(Instrumental Album Version)` annotation may be omitted by the provider only for its validated exact disc/track positions within a complete equal-count album. Every aligned base title must be canonically identical and every aligned duration must be known and compatible before any such annotation is ignored. The exception is one-way and does not erase provider-explicit `Instrumental`, `Live`, remix, remaster, or other edition evidence.
 - Complete local and Apple releases must have the same ordered `(disc number, track number)` topology.
 - Strong track pairs require very high title similarity and a duration difference no greater than `max(2 seconds, 0.5%)`, capped at 4 seconds.
 - At least 85% track coverage is required using the larger of the local and Apple track counts.
 - The default total-score threshold is 0.92.
-- The winner must beat the runner-up by at least 0.10.
+- The winner normally must beat the runner-up by at least 0.10. Duplicate catalog releases may use a duration-fingerprint tie-break only when their artist, normalized album, year, edition qualifiers, full topology, titles, track artists, and compatible durations are equivalent and the winner improves aggregate duration distance by at least 100 ms and 10%. Exact ties remain ambiguous.
 - Albums whose embedded totals indicate missing tracks are not treated as complete releases.
 - Releases normally need at least three strongly aligned tracks unless exact UPC evidence exists or `--allow-short-releases` is supplied.
 
-These thresholds favor false negatives over false positives. A `no_match` or `ambiguous` result is safer than embedding artwork from the wrong edition.
+These rules target solid release identity without requiring identical tag-writing conventions. Incomplete, reordered, semantically different, or genuinely indistinguishable releases still abstain.
 
 ## Artwork selection and validation
 
@@ -300,6 +302,8 @@ Accepted JPEG or PNG bytes are embedded as downloaded after validation; the prog
 | WavPack | APEv2 `Cover Art (Front)` | Replaces only the de-facto front-cover key |
 
 M4A/MP4 `covr` values do not have front/back roles. For those formats, `--replace-existing` replaces all current `covr` entries with the selected Apple image.
+
+DSD containers, including `.dsf` and `.dff`, are intentionally not discovered or modified.
 
 The program refuses malformed or mixed artwork stores, leading ID3 metadata on FLAC, APEv2 front art on MP3, legacy role-less `COVERART`, unsafe WavPack tag layouts, ID3v2.2, and video-bearing, fragmented, encrypted, or multi-track MP4 containers. Untested formats are not modified merely because their extension looks familiar.
 
@@ -381,7 +385,7 @@ The optional positional `root` is the library root; it defaults to the current d
 | `--overwrite-report` | Replace an existing regular in-root `.json` report |
 | `--include GLOB` | Include matching relative paths; repeatable |
 | `--exclude GLOB` | Exclude matching relative paths; repeatable |
-| `--apply-dcc` | Include relative directories beginning with `00`; does not enable `--apply` |
+| `--apply-dcc` | Include protected relative directories beginning with `00`, `DCC`, or `GZS`; does not enable `--apply` |
 | `--max-dimension PX` | Request artwork from 100 through 10,000 pixels |
 | `--allow-short-releases` | Allow one- or two-track matches without UPC evidence |
 | `--refresh-artwork` | Ignore cached artwork bytes and revalidate CDN candidates |
@@ -410,7 +414,7 @@ An embedded `n/total` value says tracks or discs are missing. Scan the complete 
 
 ### `ambiguous`
 
-Apple has multiple editions that the local metadata cannot distinguish safely. The tool will not guess. A correct UPC can provide direct Apple catalog provenance. A MusicBrainz release ID strengthens local grouping but is not looked up through Apple's API.
+Apple has multiple editions that the local metadata cannot distinguish safely. Equivalent duplicate records can be separated by a materially better duration fingerprint; exact ties and differing editions still abstain. A correct UPC can provide direct Apple catalog provenance. A MusicBrainz release ID strengthens local grouping but is not looked up through Apple's API.
 
 ### One-track or two-track release is skipped
 

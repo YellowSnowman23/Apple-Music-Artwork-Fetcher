@@ -67,6 +67,8 @@ def test_discover_audio_files_is_recursive_and_structure_agnostic(tmp_path: Path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     (tmp_path / "Artist" / "Album" / "cover.jpg").touch()
+    (tmp_path / "Artist" / "Album" / "native.dsf").touch()
+    (tmp_path / "Artist" / "Album" / "native.dff").touch()
     hidden = tmp_path / ".apple-artwork-cache" / "cached.flac"
     hidden.parent.mkdir()
     hidden.touch()

@@ -91,7 +91,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply-dcc",
         action="store_true",
-        help=("include folders whose relative names start with '00'; does not enable --apply"),
+        help=(
+            "include protected folders whose relative names start with '00', 'DCC', or 'GZS'; "
+            "does not enable --apply"
+        ),
     )
     parser.add_argument(
         "--max-dimension",
