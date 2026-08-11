@@ -72,6 +72,14 @@ def _year(value: str) -> int | None:
     return int(match.group()) if match else None
 
 
+class _DiscoveredAudioFiles(list[Path]):
+    """List-compatible discovery result carrying journals found in the same walk."""
+
+    def __init__(self, files: list[Path], transaction_journals: tuple[Path, ...]) -> None:
+        super().__init__(files)
+        self.transaction_journals = transaction_journals
+
+
 def discover_audio_files(root: Path) -> list[Path]:
     """Recursively discover only regular, non-symlinked files contained by root."""
     root = root.expanduser()
@@ -83,10 +91,25 @@ def discover_audio_files(root: Path) -> list[Path]:
         return []
     root_resolved = root.resolve()
     discovered: list[Path] = []
+    transaction_journals: list[Path] = []
     for path in root.rglob("*"):
         try:
-            info = path.lstat()
             relative = path.relative_to(root)
+        except ValueError:
+            continue
+        is_transaction_journal = (
+            path.name.startswith(".")
+            and ".artwork-transaction-" in path.name
+            and path.name.endswith(".json")
+        )
+        if is_transaction_journal:
+            transaction_journals.append(path)
+            continue
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        try:
             resolved = path.resolve(strict=True)
         except (OSError, ValueError):
             continue
@@ -99,7 +122,10 @@ def discover_audio_files(root: Path) -> list[Path]:
         if any(part.startswith(".") for part in relative.parts):
             continue
         discovered.append(path)
-    return sorted(discovered, key=str)
+    return _DiscoveredAudioFiles(
+        sorted(discovered, key=str),
+        tuple(sorted(transaction_journals, key=str)),
+    )
 
 
 def read_track_metadata(

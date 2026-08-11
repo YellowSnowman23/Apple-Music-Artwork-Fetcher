@@ -23,7 +23,7 @@ This project replaces the workflow described in the [original README][original-r
 
 ## Quick start
 
-`--apply` requires Linux with `renameat2(RENAME_EXCHANGE)` support. The tool embeds artwork in FLAC, MP3, audio-only M4A/MP4, Ogg Vorbis, Opus, WAVE, AIFF, and WavPack.
+`--apply` requires Linux and a filesystem that supports directory `fsync`. The preferred path uses `renameat2(RENAME_EXCHANGE)`. A capability-triggered fallback additionally requires same-directory hard links and `renameat2(RENAME_NOREPLACE)`, as supported by the tested SMB 3.1.1/CIFS mount. The tool embeds artwork in FLAC, MP3, audio-only M4A/MP4, Ogg Vorbis, Opus, WAVE, AIFF, and WavPack.
 
 ```bash
 git clone https://github.com/YellowSnowman23/Apple-Music-Artwork-Fetcher.git
@@ -72,7 +72,7 @@ Each adapter owns its format-family preflight, front-art inspection, mutation, a
 ## Requirements
 
 - Python 3.10 or newer
-- Linux with `renameat2(RENAME_EXCHANGE)` support for `--apply`
+- Linux with directory `fsync` and either `RENAME_EXCHANGE`, or both same-directory hard links and `RENAME_NOREPLACE`, for `--apply`
 - Internet access to `itunes.apple.com` and `*.mzstatic.com`
 - Correct embedded `title`, `album`, per-track `artist`, and `track number` tags; set `album artist` and `disc number` where applicable
 
@@ -95,7 +95,7 @@ Download the wheel attached to the corresponding [GitHub release][releases], the
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "/path/to/apple_music_artwork_embedder-2.1.1-py3-none-any.whl"
+python -m pip install "/path/to/apple_music_artwork_embedder-2.1.3-py3-none-any.whl"
 apple-artwork --version
 ```
 
@@ -312,10 +312,14 @@ For an accepted album in `--apply` mode:
 3. Only front-cover artwork is changed.
 4. The staged file is checked against the source for unrelated tags, non-front artwork, encoded audio payload, permissions, ownership, extended attributes, and nanosecond timestamps where supported.
 5. The source identity is checked again for ordinary concurrent edits.
-6. Linux `renameat2(RENAME_EXCHANGE)` swaps the staged and original paths atomically.
-7. The displaced inode is verified before its backup is released.
+6. Linux `renameat2(RENAME_EXCHANGE)` swaps the staged and original paths atomically when the filesystem supports it. This remains the journal-free fast path.
+7. Only when the filesystem rejects exchange with an unsupported-operation error, the fallback durably records a same-directory recovery journal and creates a verified private hard link to the original.
+8. The fallback moves the current visible entry aside with `RENAME_NOREPLACE`, verifies whether it is still the expected original, then installs the staged entry with `RENAME_NOREPLACE`. A concurrent editor save is never overwritten.
+9. The original and journal are released only after content, metadata, namespace state, and directory durability are verified. An interrupted fallback is rolled back automatically when safe; otherwise every version and the journal are retained for fail-closed recovery.
 
-If an error occurs before commit, the original path remains untouched. If an interruption or durability error happens after commit, the report uses an explicit committed status rather than claiming that no mutation occurred.
+On startup, the normal library walk also detects incomplete journals. Dry-run reports them without mutating recovery state; `--apply` recovers them before metadata parsing or network access and rescans only when recovery was needed. During the fallback's two same-directory renames, the visible name is briefly absent; the durable journal and verified recovery link cover process or machine interruption in that interval.
+
+If an error occurs before a namespace transition, the original path remains untouched. If an interruption or durability error happens during or after a transition, the tool either restores the verified original durably or reports explicit committed uncertainty while retaining recovery material.
 
 This protects against realistic accidental data loss, malformed inputs, interruptions, unsafe links, and ordinary concurrent edits. It is not a security boundary against a malicious process already running as the same OS user.
 

@@ -1,6 +1,8 @@
+import errno
 import subprocess
 from pathlib import Path
 
+import pytest
 from mutagen.flac import FLAC
 
 from apple_artwork import discover_audio_files, read_track_metadata
@@ -70,3 +72,25 @@ def test_discover_audio_files_is_recursive_and_structure_agnostic(tmp_path: Path
     hidden.touch()
 
     assert discover_audio_files(tmp_path) == expected
+
+
+def test_discovery_surfaces_journal_candidate_when_lstat_is_transiently_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audio = tmp_path / "song.flac"
+    audio.touch()
+    journal = tmp_path / ".song.flac.artwork-transaction-0123456789abcdef.json"
+    journal.write_text("{}", encoding="ascii")
+    real_lstat = Path.lstat
+
+    def fail_only_for_journal(path: Path) -> object:
+        if path == journal:
+            raise OSError(errno.EIO, "transient SMB metadata failure")
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_only_for_journal)
+
+    discovered = discover_audio_files(tmp_path)
+
+    assert discovered == [audio]
+    assert journal in discovered.transaction_journals

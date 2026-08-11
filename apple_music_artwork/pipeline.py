@@ -10,7 +10,12 @@ from pathlib import Path
 
 from .artwork import ArtworkDownloader
 from .catalog import AppleCatalogClient
-from .embedding import _verify_group_sources, embed_artwork, preflight_artwork
+from .embedding import (
+    _verify_group_sources,
+    embed_artwork,
+    preflight_artwork,
+    recover_transaction_journals,
+)
 from .filesystem import _open_secure_directory
 from .matching import choose_match
 from .metadata import (
@@ -110,6 +115,22 @@ def process_library(
     )
 
     discovered = discover_audio_files(root)
+    transaction_journals = tuple(getattr(discovered, "transaction_journals", ()))
+    if transaction_journals:
+        if not apply:
+            raise ValueError(
+                f"found {len(transaction_journals)} incomplete artwork transaction(s); "
+                "rerun with --apply to recover them before a dry run"
+            )
+        recovered_paths = recover_transaction_journals(transaction_journals)
+        for recovered_path in recovered_paths:
+            say(f"RECOVER {recovered_path}")
+        discovered = discover_audio_files(root)
+        remaining_journals = tuple(getattr(discovered, "transaction_journals", ()))
+        if remaining_journals:
+            raise ValueError(
+                "transaction recovery did not clear every journal; refusing to continue"
+            )
     selected: list[Path] = []
     dcc_omitted_files = 0
     for path in discovered:

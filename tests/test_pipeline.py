@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -521,3 +522,28 @@ def test_main_prints_stable_low_confidence_and_metadata_failure_fields(
     output = capsys.readouterr().out
     assert "low_confidence=1" in output
     assert "metadata_failures=0" in output
+
+
+def test_apply_rejects_nonregular_transaction_journal_without_blocking(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / ".song.flac.artwork-transaction-fifo.json"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(journal)
+
+    with pytest.raises(EmbedError, match="unsafe transaction journal"):
+        process_library(tmp_path, apply=True, report_path=None)
+
+    assert journal.is_fifo()
+
+
+def test_dry_run_detects_incomplete_transaction_without_mutating_it(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / ".song.flac.artwork-transaction-test.json"
+    journal.write_text("{}\n", encoding="ascii")
+
+    with pytest.raises(ValueError, match=r"incomplete artwork transaction.*--apply"):
+        process_library(tmp_path, apply=False, report_path=None)
+
+    assert journal.read_text(encoding="ascii") == "{}\n"
