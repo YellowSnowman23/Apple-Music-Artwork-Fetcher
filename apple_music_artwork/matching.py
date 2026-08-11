@@ -149,6 +149,87 @@ def _title_similarity(left: str, right: str) -> float:
     )
 
 
+_TRAILING_REMASTER = re.compile(
+    r"\s*[\[(]\s*(?P<label>"
+    r"(?:(?:18|19|20|21)\d{2}\s+)?"
+    r"(?:digital\s+)?remaster(?:ed)?"
+    r"(?:\s+(?:18|19|20|21)\d{2})?"
+    r")\s*[\])]\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _split_trailing_remaster(value: str) -> tuple[str, str] | None:
+    match = _TRAILING_REMASTER.search(value)
+    if match is None:
+        return None
+    return value[: match.start()].rstrip(), normalize_text(match.group("label"))
+
+
+def _remaster_annotation_state(
+    tracks: Iterable[TrackMetadata | CatalogTrack],
+) -> tuple[str, str | None]:
+    parsed = tuple(_split_trailing_remaster(track.title) for track in tracks)
+    if parsed and all(item is None for item in parsed):
+        return "absent", None
+    if parsed and all(item is not None for item in parsed):
+        labels = {item[1] for item in parsed if item is not None}
+        if len(labels) == 1:
+            return "uniform", next(iter(labels))
+    return "mixed", None
+
+
+def _complete_positions(
+    tracks: Iterable[TrackMetadata | CatalogTrack],
+) -> tuple[tuple[int, int], ...] | None:
+    positions: list[tuple[int, int]] = []
+    for track in tracks:
+        number = track.track_number
+        disc = track.disc_number or 1
+        if number is None or number < 1 or disc < 1:
+            return None
+        positions.append((disc, number))
+    if len(positions) != len(set(positions)):
+        return None
+    return tuple(sorted(positions))
+
+
+def _provider_omitted_uniform_remaster(
+    local_tracks: tuple[TrackMetadata, ...],
+    remote_tracks: tuple[CatalogTrack, ...],
+) -> tuple[bool, bool]:
+    if len(local_tracks) < 3 or len(local_tracks) != len(remote_tracks):
+        return False, False
+    local_positions = _complete_positions(local_tracks)
+    remote_positions = _complete_positions(remote_tracks)
+    if local_positions is None or local_positions != remote_positions:
+        return False, False
+
+    local_state, _local_label = _remaster_annotation_state(local_tracks)
+    remote_state, _remote_label = _remaster_annotation_state(remote_tracks)
+    if local_state != "uniform" or remote_state != "absent":
+        return False, False
+
+    remote_by_position = {
+        (track.disc_number or 1, track.track_number): track for track in remote_tracks
+    }
+    for local in local_tracks:
+        remote = remote_by_position[(local.disc_number or 1, local.track_number)]
+        parsed_local = _split_trailing_remaster(local.title)
+        assert parsed_local is not None
+        local_title = parsed_local[0]
+        remote_title = remote.title
+        if (
+            normalize_text(local_title) != normalize_text(remote_title)
+            or _has_version_conflict(local_title, remote_title)
+            or local.duration_ms is None
+            or remote.duration_ms is None
+            or _duration_similarity(local.duration_ms, remote.duration_ms) == 0
+        ):
+            return False, False
+    return True, False
+
+
 def _duration_similarity(left_ms: int | None, right_ms: int | None) -> float:
     if left_ms is None or right_ms is None:
         return 0.5
@@ -175,12 +256,25 @@ def _position_similarity(local: TrackMetadata, remote: CatalogTrack) -> float:
 def _match_tracks(
     local_tracks: tuple[TrackMetadata, ...], remote_tracks: tuple[CatalogTrack, ...]
 ) -> list[tuple[TrackMetadata, CatalogTrack, float, float, float]]:
+    strip_local_remaster, strip_remote_remaster = _provider_omitted_uniform_remaster(
+        local_tracks, remote_tracks
+    )
     possible: list[tuple[float, TrackMetadata, CatalogTrack, float, float, float]] = []
     for local in local_tracks:
         for remote in remote_tracks:
-            title_score = _title_similarity(local.title, remote.title)
+            local_title = local.title
+            remote_title = remote.title
+            if strip_local_remaster:
+                parsed_local = _split_trailing_remaster(local_title)
+                assert parsed_local is not None
+                local_title = parsed_local[0]
+            if strip_remote_remaster:
+                parsed_remote = _split_trailing_remaster(remote_title)
+                assert parsed_remote is not None
+                remote_title = parsed_remote[0]
+            title_score = _title_similarity(local_title, remote_title)
             duration_score = _duration_similarity(local.duration_ms, remote.duration_ms)
-            if title_score < 0.93 or _has_version_conflict(local.title, remote.title):
+            if title_score < 0.93 or _has_version_conflict(local_title, remote_title):
                 continue
             if (
                 local.duration_ms is not None

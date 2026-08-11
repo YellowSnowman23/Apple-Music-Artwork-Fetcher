@@ -95,7 +95,7 @@ Download the wheel attached to the corresponding [GitHub release][releases], the
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "/path/to/apple_music_artwork_embedder-2.1.3-py3-none-any.whl"
+python -m pip install "/path/to/apple_music_artwork_embedder-2.1.4-py3-none-any.whl"
 apple-artwork --version
 ```
 
@@ -257,6 +257,7 @@ A candidate must then pass the release and tracklist gates:
 - The hard edition gate recognizes: deluxe, expanded, anniversary, special edition, collector's edition, extended, soundtrack, live, mono, stereo, acoustic, instrumental, radio edit, drumless, demo, bonus, remaster, and remix. Conflicting recognized qualifier sets are rejected.
 - Other edition wording is handled only by title similarity; it does not trigger a categorical edition rejection. Inspect unusual labels carefully in the dry-run report.
 - A trailing bracketed `Album Version` annotation is treated as neutral for track-title comparison.
+- A provider-omitted trailing remaster annotation is neutral only when every local track applies the same annotation, every provider track omits it, at least three tracks are present, track counts and full disc/track topology agree, and every position-aligned stripped local title is canonically identical to the provider title with a known, compatible duration. This exception is intentionally one-way: an explicit provider remaster label is never stripped to match unqualified local tags. Artist, coverage, album-edition, score, and ambiguity gates still apply.
 - Complete local and Apple releases must have the same ordered `(disc number, track number)` topology.
 - Strong track pairs require very high title similarity and a duration difference no greater than `max(2 seconds, 0.5%)`, capped at 4 seconds.
 - At least 85% track coverage is required using the larger of the local and Apple track counts.
