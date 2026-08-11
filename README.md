@@ -95,7 +95,7 @@ Download the wheel attached to the corresponding [GitHub release][releases], the
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "/path/to/apple_music_artwork_embedder-2.1.4-py3-none-any.whl"
+python -m pip install "/path/to/apple_music_artwork_embedder-2.1.5-py3-none-any.whl"
 apple-artwork --version
 ```
 
@@ -258,6 +258,7 @@ A candidate must then pass the release and tracklist gates:
 - Other edition wording is handled only by title similarity; it does not trigger a categorical edition rejection. Inspect unusual labels carefully in the dry-run report.
 - A trailing bracketed `Album Version` annotation is treated as neutral for track-title comparison.
 - A provider-omitted trailing remaster annotation is neutral only when every local track applies the same annotation, every provider track omits it, at least three tracks are present, track counts and full disc/track topology agree, and every position-aligned stripped local title is canonically identical to the provider title with a known, compatible duration. This exception is intentionally one-way: an explicit provider remaster label is never stripped to match unqualified local tags. Artist, coverage, album-edition, score, and ambiguity gates still apply.
+- A trailing local `(Instrumental Album Version)` annotation may be omitted by the provider only for its validated exact disc/track positions within a complete equal-count album. Every aligned base title must be canonically identical and every aligned duration must be known and compatible before any such annotation is ignored. The exception is one-way and does not erase provider-explicit `Instrumental`, `Live`, remix, remaster, or other edition evidence.
 - Complete local and Apple releases must have the same ordered `(disc number, track number)` topology.
 - Strong track pairs require very high title similarity and a duration difference no greater than `max(2 seconds, 0.5%)`, capped at 4 seconds.
 - At least 85% track coverage is required using the larger of the local and Apple track counts.

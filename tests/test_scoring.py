@@ -82,6 +82,221 @@ def test_trailing_album_version_annotation_does_not_block_tracklist_match() -> N
     assert score.components["track_coverage"] == 1.0
 
 
+def _van_halen_iii_case() -> tuple[AlbumGroup, CatalogAlbum]:
+    local_rows = (
+        ("Neworld (Instrumental Album Version)", 105_560),
+        ("Without You (Album Version)", 390_107),
+        ("One I Want (Album Version)", 330_800),
+        ("From Afar (Album Version)", 324_227),
+        ("Dirty Water Dog (Album Version)", 327_307),
+        ("Once (Album Version)", 462_733),
+        ("Fire in the Hole", 331_627),
+        ("Josephina (Album Version)", 342_400),
+        ("Year to the Day (Album Version)", 514_533),
+        ("Primary (Instrumental Album Version)", 87_000),
+        ("Ballot or the Bullet (Album Version)", 342_107),
+        ("How Many Say I (Album Version)", 364_027),
+    )
+    remote_rows = (
+        ("Neworld", 105_560),
+        ("Without You", 390_107),
+        ("One I Want", 330_800),
+        ("From Afar", 324_227),
+        ("Dirty Water Dog", 327_307),
+        ("Once", 462_733),
+        ("Fire In the Hole", 331_627),
+        ("Josephina", 342_400),
+        ("Year to the Day", 514_533),
+        ("Primary", 87_000),
+        ("Ballot or the Bullet", 342_107),
+        ("How Many Say I", 364_027),
+    )
+    tracks = tuple(
+        TrackMetadata(
+            path=Path(f"{number:02}.flac"),
+            title=title,
+            artist="Van Halen",
+            album="Van Halen III",
+            album_artist="Van Halen",
+            year=1998,
+            track_number=number,
+            track_total=12,
+            disc_number=1,
+            disc_total=1,
+            duration_ms=duration,
+        )
+        for number, (title, duration) in enumerate(local_rows, start=1)
+    )
+    group = AlbumGroup(
+        album="Van Halen III",
+        album_artist="Van Halen",
+        year=1998,
+        files=tuple(track.path for track in tracks),
+        logical_tracks=tracks,
+    )
+    candidate = CatalogAlbum(
+        collection_id=215638174,
+        album="Van Halen III",
+        artist="Van Halen",
+        release_year=1998,
+        artwork_url="https://is1-ssl.mzstatic.com/image/thumb/Music/example.jpg/100x100bb.jpg",
+        track_count=12,
+        tracks=tuple(
+            CatalogTrack(title, "Van Halen", duration, 1, number)
+            for number, (title, duration) in enumerate(remote_rows, start=1)
+        ),
+    )
+    return group, candidate
+
+
+def test_provider_omitted_instrumental_album_version_matches_complete_album() -> None:
+    group, candidate = _van_halen_iii_case()
+
+    score = score_candidate(group, candidate)
+    decision = choose_match(group, [candidate])
+
+    assert score.eligible is True
+    assert score.components["track_coverage"] == 1.0
+    assert score.components["track_title"] == 1.0
+    assert decision.status == "matched"
+    assert decision.match is not None
+    assert decision.match.candidate.collection_id == 215638174
+
+
+def test_provider_omitted_instrumental_requires_known_aligned_durations() -> None:
+    group, candidate = _van_halen_iii_case()
+    tracks = tuple(
+        replace(track, duration_ms=None) if track.track_number == 2 else track
+        for track in group.logical_tracks
+    )
+    incomplete_evidence = replace(
+        group,
+        files=tuple(track.path for track in tracks),
+        logical_tracks=tracks,
+    )
+
+    decision = choose_match(incomplete_evidence, [candidate])
+
+    assert decision.status == "no_match"
+    assert decision.scores[0].components["track_coverage"] < 0.85
+
+
+def test_provider_omitted_instrumental_rejects_incompatible_aligned_duration() -> None:
+    group, candidate = _van_halen_iii_case()
+    tracks = tuple(
+        replace(track, duration_ms=track.duration_ms + 10_000)
+        if track.track_number == 2 and track.duration_ms is not None
+        else track
+        for track in group.logical_tracks
+    )
+    incompatible_group = replace(
+        group,
+        files=tuple(track.path for track in tracks),
+        logical_tracks=tracks,
+    )
+
+    decision = choose_match(incompatible_group, [candidate])
+
+    assert decision.status == "no_match"
+    assert decision.scores[0].components["track_coverage"] < 0.85
+
+
+def test_provider_omitted_instrumental_requires_matching_topology() -> None:
+    group, candidate = _van_halen_iii_case()
+    remote_tracks = (
+        replace(candidate.tracks[0], track_number=13),
+        *candidate.tracks[1:],
+    )
+
+    decision = choose_match(group, [replace(candidate, tracks=remote_tracks)])
+
+    assert decision.status == "no_match"
+    assert "disc/track topology mismatch" in decision.scores[0].reasons
+
+
+def test_provider_omitted_instrumental_rejects_reordered_equal_duration_tracks() -> None:
+    group, candidate = _van_halen_iii_case()
+    local_tracks = tuple(
+        replace(track, duration_ms=100_000) if track.track_number in {1, 10} else track
+        for track in group.logical_tracks
+    )
+    reordered_group = replace(
+        group,
+        files=tuple(track.path for track in local_tracks),
+        logical_tracks=local_tracks,
+    )
+    remote_tracks = tuple(
+        replace(track, title="Primary", duration_ms=100_000)
+        if track.track_number == 1
+        else replace(track, title="Neworld", duration_ms=100_000)
+        if track.track_number == 10
+        else track
+        for track in candidate.tracks
+    )
+
+    decision = choose_match(reordered_group, [replace(candidate, tracks=remote_tracks)])
+
+    assert decision.status == "no_match"
+    assert decision.scores[0].components["track_coverage"] < 0.85
+
+
+def test_provider_omitted_instrumental_never_strips_provider_explicit_label() -> None:
+    group, candidate = _van_halen_iii_case()
+    local_tracks = tuple(
+        replace(track, title="Neworld")
+        if track.track_number == 1
+        else replace(track, title="Primary")
+        if track.track_number == 10
+        else track
+        for track in group.logical_tracks
+    )
+    plain_group = replace(
+        group,
+        files=tuple(track.path for track in local_tracks),
+        logical_tracks=local_tracks,
+    )
+    remote_tracks = tuple(
+        replace(track, title=f"{track.title} (Instrumental)")
+        if track.track_number in {1, 10}
+        else track
+        for track in candidate.tracks
+    )
+
+    decision = choose_match(plain_group, [replace(candidate, tracks=remote_tracks)])
+
+    assert decision.status == "no_match"
+    assert decision.scores[0].components["track_coverage"] < 0.85
+
+
+def test_provider_omitted_instrumental_preserves_live_conflicts() -> None:
+    group, candidate = _van_halen_iii_case()
+    local_tracks = tuple(
+        replace(track, title="Neworld (Live Instrumental Album Version)")
+        if track.track_number == 1
+        else track
+        for track in group.logical_tracks
+    )
+    conflicting_group = replace(
+        group,
+        files=tuple(track.path for track in local_tracks),
+        logical_tracks=local_tracks,
+    )
+
+    decision = choose_match(conflicting_group, [candidate])
+
+    assert decision.status == "no_match"
+    assert decision.scores[0].components["track_coverage"] < 0.85
+
+
+def test_provider_omitted_instrumental_preserves_candidate_ambiguity() -> None:
+    group, candidate = _van_halen_iii_case()
+
+    decision = choose_match(group, [candidate, replace(candidate, collection_id=999_999)])
+
+    assert decision.status == "ambiguous"
+    assert decision.match is None
+
+
 def test_uniform_trailing_remaster_annotations_match_plain_apple_track_titles() -> None:
     local_rows = (
         ("1984 (2015 Remaster)", 67_665),

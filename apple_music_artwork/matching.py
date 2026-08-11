@@ -123,21 +123,22 @@ def _has_version_conflict(left: str, right: str) -> bool:
     return _version_qualifiers(left) != _version_qualifiers(right)
 
 
+def _without_trailing_album_version(value: str) -> str:
+    return re.sub(
+        r"\s*[\[(]\s*album\s+version\s*[\])]\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
 def _title_similarity(left: str, right: str) -> float:
     def without_feature(value: str) -> str:
         normalized = normalize_text(value)
         return re.split(r"\b(?:feat|featuring|ft)\b", normalized, maxsplit=1)[0].strip()
 
-    def without_album_version(value: str) -> str:
-        return re.sub(
-            r"\s*[\[(]\s*album\s+version\s*[\])]\s*$",
-            "",
-            value,
-            flags=re.IGNORECASE,
-        )
-
-    left_without_version = without_album_version(left)
-    right_without_version = without_album_version(right)
+    left_without_version = _without_trailing_album_version(left)
+    right_without_version = _without_trailing_album_version(right)
     return max(
         text_similarity(left, right),
         text_similarity(without_feature(left), without_feature(right)),
@@ -192,6 +193,57 @@ def _complete_positions(
     if len(positions) != len(set(positions)):
         return None
     return tuple(sorted(positions))
+
+
+_TRAILING_INSTRUMENTAL_ALBUM_VERSION = re.compile(
+    r"\s*[\[(]\s*instrumental\s+album\s+version\s*[\])]\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _split_trailing_instrumental_album_version(value: str) -> str | None:
+    match = _TRAILING_INSTRUMENTAL_ALBUM_VERSION.search(value)
+    if match is None:
+        return None
+    return value[: match.start()].rstrip()
+
+
+def _provider_omitted_instrumental_album_versions(
+    local_tracks: tuple[TrackMetadata, ...],
+    remote_tracks: tuple[CatalogTrack, ...],
+) -> frozenset[tuple[int, int]]:
+    if len(local_tracks) < 3 or len(local_tracks) != len(remote_tracks):
+        return frozenset()
+    local_positions = _complete_positions(local_tracks)
+    remote_positions = _complete_positions(remote_tracks)
+    if local_positions is None or local_positions != remote_positions:
+        return frozenset()
+
+    remote_by_position = {
+        (track.disc_number or 1, track.track_number): track for track in remote_tracks
+    }
+    omitted_positions: set[tuple[int, int]] = set()
+    for local in local_tracks:
+        assert local.track_number is not None
+        position = (local.disc_number or 1, local.track_number)
+        remote = remote_by_position[position]
+        local_base = _split_trailing_instrumental_album_version(local.title)
+        if local_base is not None:
+            if _version_qualifiers(remote.title):
+                return frozenset()
+            omitted_positions.add(position)
+        else:
+            local_base = _without_trailing_album_version(local.title)
+        remote_base = _without_trailing_album_version(remote.title)
+        if (
+            normalize_text(local_base) != normalize_text(remote_base)
+            or _has_version_conflict(local_base, remote_base)
+            or local.duration_ms is None
+            or remote.duration_ms is None
+            or _duration_similarity(local.duration_ms, remote.duration_ms) == 0
+        ):
+            return frozenset()
+    return frozenset(omitted_positions)
 
 
 def _provider_omitted_uniform_remaster(
@@ -259,11 +311,23 @@ def _match_tracks(
     strip_local_remaster, strip_remote_remaster = _provider_omitted_uniform_remaster(
         local_tracks, remote_tracks
     )
+    strip_local_instrumental_positions = _provider_omitted_instrumental_album_versions(
+        local_tracks, remote_tracks
+    )
     possible: list[tuple[float, TrackMetadata, CatalogTrack, float, float, float]] = []
     for local in local_tracks:
         for remote in remote_tracks:
             local_title = local.title
             remote_title = remote.title
+            local_position = (local.disc_number or 1, local.track_number)
+            remote_position = (remote.disc_number or 1, remote.track_number)
+            if (
+                local_position == remote_position
+                and local_position in strip_local_instrumental_positions
+            ):
+                parsed_local_instrumental = _split_trailing_instrumental_album_version(local_title)
+                assert parsed_local_instrumental is not None
+                local_title = parsed_local_instrumental
             if strip_local_remaster:
                 parsed_local = _split_trailing_remaster(local_title)
                 assert parsed_local is not None
