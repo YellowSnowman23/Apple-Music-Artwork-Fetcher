@@ -16,7 +16,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apple-artwork",
         description=(
-            "Accuracy-first Apple artwork matching. Dry-run is the default; "
+            "Identifier-first Apple artwork matching. Dry-run is the default; "
             "audio files change only with --apply."
         ),
     )

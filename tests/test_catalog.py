@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from apple_artwork import (
@@ -8,7 +9,19 @@ from apple_artwork import (
     candidate_ids_from_album_search,
     candidate_ids_from_song_search,
     catalog_albums_from_lookup,
+    choose_match,
 )
+from apple_music_artwork.models import MusicBrainzRelease
+
+
+class FakeMusicBrainzClient:
+    def __init__(self, release: MusicBrainzRelease | None) -> None:
+        self.release = release
+        self.calls: list[str] = []
+
+    def resolve(self, release_id: str) -> MusicBrainzRelease | None:
+        self.calls.append(release_id)
+        return self.release
 
 
 def test_catalog_albums_from_lookup_groups_collection_and_song_rows() -> None:
@@ -96,6 +109,29 @@ def test_album_search_keeps_exact_artist_equal_count_edition_candidate() -> None
         "5150",
         track_count=30,
     ) == [1873373091]
+
+
+def test_identifier_album_search_never_uses_track_count_as_identity() -> None:
+    rows = [
+        {
+            "collectionId": 1,
+            "collectionName": "Completely Unrelated",
+            "artistName": "Wrong Artist",
+            "trackCount": 6,
+            "artworkUrl100": "https://example.invalid/wrong.jpg",
+        }
+    ]
+
+    assert (
+        candidate_ids_from_album_search(
+            rows,
+            "Canonical Artist",
+            "Canonical Album",
+            track_count=6,
+            identifier_first=True,
+        )
+        == []
+    )
 
 
 def test_song_search_accepts_provider_omitted_local_remaster_for_discovery() -> None:
@@ -317,6 +353,481 @@ def test_catalog_client_prefers_exact_upc_lookup_when_barcode_is_tagged(tmp_path
     assert [album.collection_id for album in albums] == [99]
     assert len(session.calls) == 1
     assert session.calls[0][0].endswith("/lookup")
+    assert session.calls[0][1]["upc"] == "012345678905"
+    assert albums[0].identifier_resolution == "embedded_upc"
+
+
+def test_catalog_client_does_not_fuzzy_match_an_unresolved_upc(tmp_path: Path) -> None:
+    session = FakeSession([{"results": []}])
+    track = TrackMetadata(
+        Path("song.flac"),
+        "Tagged Song",
+        "Tagged Artist",
+        "Tagged Album",
+        "Tagged Artist",
+        2024,
+        1,
+        1,
+        1,
+        1,
+        100_000,
+        "012345678905",
+    )
+    group = AlbumGroup(
+        "Tagged Album",
+        "Tagged Artist",
+        2024,
+        (track.path,),
+        (track,),
+        barcode="012345678905",
+    )
+    client = AppleCatalogClient(cache_dir=tmp_path / "cache", session=session, api_interval=0)
+
+    assert client.find_candidates(group) == []
+    assert len(session.calls) == 1
+    assert client.last_identifier_warnings == (
+        "the embedded UPC returned no usable complete Apple album",
+    )
+
+
+def test_catalog_client_returns_exact_upc_results_without_legacy_identity_gates(
+    tmp_path: Path,
+) -> None:
+    wrong_upc_rows = [
+        {
+            "wrapperType": "collection",
+            "collectionId": 98,
+            "collectionName": "Wrong Parent Album",
+            "artistName": "Tagged Artist",
+            "releaseDate": "2024-01-01T00:00:00Z",
+            "trackCount": 2,
+            "artworkUrl100": "https://is1-ssl.mzstatic.com/a/100x100bb.jpg",
+        },
+        *(
+            {
+                "wrapperType": "track",
+                "kind": "song",
+                "collectionId": 98,
+                "artistName": "Tagged Artist",
+                "trackName": title,
+                "trackTimeMillis": 100_000 + number,
+                "discNumber": 1,
+                "trackNumber": number,
+            }
+            for number, title in enumerate(("Wrong Song", "Tagged Song"), start=1)
+        ),
+    ]
+    search_rows = [
+        {
+            "collectionId": 99,
+            "collectionName": "Tagged Album",
+            "artistName": "Tagged Artist",
+            "trackCount": 1,
+            "artworkUrl100": "https://is1-ssl.mzstatic.com/a/100x100bb.jpg",
+        }
+    ]
+    correct_lookup_rows = [
+        {
+            "wrapperType": "collection",
+            "collectionId": 99,
+            "collectionName": "Tagged Album",
+            "artistName": "Tagged Artist",
+            "releaseDate": "2024-01-01T00:00:00Z",
+            "trackCount": 1,
+            "artworkUrl100": "https://is1-ssl.mzstatic.com/a/100x100bb.jpg",
+        },
+        {
+            "wrapperType": "track",
+            "kind": "song",
+            "collectionId": 99,
+            "artistName": "Tagged Artist",
+            "trackName": "Tagged Song",
+            "trackTimeMillis": 100_000,
+            "discNumber": 1,
+            "trackNumber": 1,
+        },
+    ]
+    session = FakeSession(
+        [
+            {"results": wrong_upc_rows},
+            {"results": search_rows},
+            {"results": correct_lookup_rows},
+        ]
+    )
+    track = TrackMetadata(
+        path=Path("song.flac"),
+        title="Tagged Song",
+        artist="Tagged Artist",
+        album="Tagged Album",
+        album_artist="Tagged Artist",
+        year=2024,
+        track_number=1,
+        track_total=1,
+        disc_number=1,
+        disc_total=1,
+        duration_ms=100_000,
+        barcode="012345678905",
+        musicbrainz_release_id="12345678-1234-5678-9234-567812345678",
+        musicbrainz_recording_id="abcdefab-cdef-4abc-8def-abcdefabcdef",
+    )
+    group = AlbumGroup(
+        "Tagged Album",
+        "Tagged Artist",
+        2024,
+        (track.path,),
+        (track,),
+        barcode="012345678905",
+        musicbrainz_release_id="12345678-1234-5678-9234-567812345678",
+        musicbrainz_provenance_complete=True,
+    )
+    musicbrainz = FakeMusicBrainzClient(None)
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=musicbrainz,
+        api_interval=0,
+    )
+
+    albums = client.find_candidates(group)
+
+    assert {album.collection_id for album in albums} == {98}
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["upc"] == "012345678905"
+    assert musicbrainz.calls == [group.musicbrainz_release_id]
+
+
+def _musicbrainz_group() -> AlbumGroup:
+    release_id = "12345678-1234-5678-9234-567812345678"
+    track = TrackMetadata(
+        path=Path("song.flac"),
+        title="Local Presentation",
+        artist="Tagged Artist",
+        album="Tagged Album",
+        album_artist="Tagged Artist",
+        year=2024,
+        track_number=1,
+        track_total=1,
+        disc_number=1,
+        disc_total=1,
+        duration_ms=100_000,
+        musicbrainz_release_id=release_id,
+    )
+    return AlbumGroup(
+        "Tagged Album",
+        "Tagged Artist",
+        2024,
+        (track.path,),
+        (track,),
+        musicbrainz_release_id=release_id,
+    )
+
+
+def test_catalog_client_uses_musicbrainz_apple_relation_before_text_search(
+    tmp_path: Path,
+) -> None:
+    group = _musicbrainz_group()
+    recording_id = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+    group = replace(
+        group,
+        logical_tracks=(replace(group.logical_tracks[0], musicbrainz_recording_id=recording_id),),
+        musicbrainz_provenance_complete=True,
+    )
+    relation = MusicBrainzRelease(
+        release_id=group.musicbrainz_release_id or "",
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=1,
+        barcode=None,
+        apple_collection_ids=(99,),
+        recording_ids=(recording_id,),
+    )
+    musicbrainz = FakeMusicBrainzClient(relation)
+    session = FakeSession(
+        [
+            {
+                "results": [
+                    {
+                        "wrapperType": "collection",
+                        "collectionId": 99,
+                        "collectionName": "Apple Presentation",
+                        "artistName": "Apple Artist",
+                        "releaseDate": "2024-01-01T00:00:00Z",
+                        "trackCount": 1,
+                        "artworkUrl100": "https://is1-ssl.mzstatic.com/a/100x100bb.jpg",
+                    },
+                    {
+                        "wrapperType": "track",
+                        "kind": "song",
+                        "collectionId": 99,
+                        "artistName": "Apple Artist",
+                        "trackName": "Apple Track Presentation",
+                        "trackTimeMillis": 100_000,
+                        "discNumber": 1,
+                        "trackNumber": 1,
+                    },
+                ]
+            }
+        ]
+    )
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=musicbrainz,
+        api_interval=0,
+    )
+
+    albums = client.find_candidates(group)
+
+    assert [album.collection_id for album in albums] == [99]
+    assert albums[0].verified_musicbrainz_release_id == group.musicbrainz_release_id
+    assert albums[0].identifier_resolution == "musicbrainz_apple_relation"
+    assert albums[0].musicbrainz_recordings_verified is True
+    assert musicbrainz.calls == [group.musicbrainz_release_id]
+    assert session.calls[0][1]["id"] == "99"
+
+
+def test_catalog_client_preserves_resolved_musicbrainz_identity_through_search(
+    tmp_path: Path,
+) -> None:
+    group = _musicbrainz_group()
+    release = MusicBrainzRelease(
+        release_id=group.musicbrainz_release_id or "",
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=1,
+        barcode=None,
+    )
+    musicbrainz = FakeMusicBrainzClient(release)
+    search_rows = [
+        {
+            "collectionId": 99,
+            "collectionName": "Canonical Album",
+            "artistName": "Canonical Artist",
+            "trackCount": 1,
+            "artworkUrl100": "https://is1-ssl.mzstatic.com/a/100x100bb.jpg",
+        }
+    ]
+    lookup_rows = [
+        {
+            "wrapperType": "collection",
+            "collectionId": 99,
+            "collectionName": "Canonical Album",
+            "artistName": "Canonical Artist",
+            "releaseDate": "2024-01-01T00:00:00Z",
+            "trackCount": 1,
+            "artworkUrl100": "https://is1-ssl.mzstatic.com/a/100x100bb.jpg",
+        },
+        {
+            "wrapperType": "track",
+            "kind": "song",
+            "collectionId": 99,
+            "artistName": "Canonical Artist",
+            "trackName": "Canonical Track",
+            "trackTimeMillis": 100_000,
+            "discNumber": 1,
+            "trackNumber": 1,
+        },
+    ]
+    session = FakeSession([{"results": search_rows}, {"results": lookup_rows}])
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=musicbrainz,
+        api_interval=0,
+    )
+
+    albums = client.find_candidates(group)
+    decision = choose_match(group, albums)
+
+    assert [album.collection_id for album in albums] == [99]
+    assert albums[0].identifier_resolution == "musicbrainz_search"
+    assert decision.status == "matched"
+    assert decision.match is not None
+    assert any("resolved MusicBrainz identity" in warning for warning in decision.match.warnings)
+
+
+def test_catalog_client_never_uses_local_song_fallback_for_resolved_mbid(
+    tmp_path: Path,
+) -> None:
+    group = _musicbrainz_group()
+    release = MusicBrainzRelease(
+        release_id=group.musicbrainz_release_id or "",
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=1,
+        barcode=None,
+    )
+    session = FakeSession([{"results": []}])
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=FakeMusicBrainzClient(release),
+        api_interval=0,
+    )
+
+    assert client.find_candidates(group) == []
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["entity"] == "album"
+    assert session.calls[0][1]["term"] == "Canonical Artist Canonical Album"
+
+
+def test_catalog_client_blocks_conflicting_embedded_and_musicbrainz_barcodes(
+    tmp_path: Path,
+) -> None:
+    group = replace(_musicbrainz_group(), barcode="012345678905")
+    release = MusicBrainzRelease(
+        release_id=group.musicbrainz_release_id or "",
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=1,
+        barcode="4006381333931",
+        apple_collection_ids=(99,),
+    )
+    session = FakeSession([{"results": []}])
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=FakeMusicBrainzClient(release),
+        api_interval=0,
+    )
+
+    assert client.find_candidates(group) == []
+    assert len(session.calls) == 1
+    assert client.last_identifier_warnings[-1] == (
+        "the embedded UPC conflicts with the resolved MusicBrainz release barcode"
+    )
+
+
+def test_catalog_client_blocks_recording_mbids_outside_the_resolved_release(
+    tmp_path: Path,
+) -> None:
+    group = _musicbrainz_group()
+    recording_id = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+    track = replace(group.logical_tracks[0], musicbrainz_recording_id=recording_id)
+    group = replace(
+        group,
+        logical_tracks=(track,),
+        musicbrainz_provenance_complete=True,
+    )
+    release = MusicBrainzRelease(
+        release_id=group.musicbrainz_release_id or "",
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=1,
+        barcode=None,
+        recording_ids=("12345678-1234-4abc-8def-123456789abc",),
+    )
+    session = FakeSession([])
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=FakeMusicBrainzClient(release),
+        api_interval=0,
+    )
+
+    assert client.find_candidates(group) == []
+    assert session.calls == []
+    assert client.last_identifier_warnings == (
+        "the embedded recording MBIDs could not be verified against the resolved "
+        "MusicBrainz release (including possible merged aliases)",
+    )
+
+
+def test_catalog_client_does_not_search_apple_when_musicbrainz_cannot_resolve(
+    tmp_path: Path,
+) -> None:
+    group = _musicbrainz_group()
+    musicbrainz = FakeMusicBrainzClient(None)
+    session = FakeSession([])
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=musicbrainz,
+        api_interval=0,
+    )
+
+    assert client.find_candidates(group) == []
+    assert musicbrainz.calls == [group.musicbrainz_release_id]
+    assert session.calls == []
+    assert client.last_identifier_warnings == (
+        "MusicBrainz did not resolve the embedded release MBID; no unverified Apple "
+        "candidate was trusted",
+    )
+
+
+def test_catalog_client_stops_before_network_on_grouped_identifier_conflicts(
+    tmp_path: Path,
+) -> None:
+    conflict = "conflicting UPC/barcode tags within the album group"
+    group = replace(_musicbrainz_group(), identifier_conflicts=(conflict,))
+    session = FakeSession([])
+    musicbrainz = FakeMusicBrainzClient(None)
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=musicbrainz,
+        api_interval=0,
+    )
+
+    assert client.find_candidates(group) == []
+    assert session.calls == []
+    assert musicbrainz.calls == []
+    assert client.last_identifier_warnings == (conflict,)
+
+
+def test_catalog_client_uses_musicbrainz_barcode_as_an_apple_crosswalk(
+    tmp_path: Path,
+) -> None:
+    group = _musicbrainz_group()
+    release = MusicBrainzRelease(
+        release_id=group.musicbrainz_release_id or "",
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=1,
+        barcode="012345678905",
+    )
+    musicbrainz = FakeMusicBrainzClient(release)
+    lookup_rows = [
+        {
+            "wrapperType": "collection",
+            "collectionId": 99,
+            "collectionName": "Apple Presentation",
+            "artistName": "Apple Artist",
+            "releaseDate": "2024-01-01T00:00:00Z",
+            "trackCount": 1,
+            "artworkUrl100": "https://is1-ssl.mzstatic.com/a/100x100bb.jpg",
+        },
+        {
+            "wrapperType": "track",
+            "kind": "song",
+            "collectionId": 99,
+            "artistName": "Apple Artist",
+            "trackName": "Apple Track Presentation",
+            "trackTimeMillis": 100_000,
+            "discNumber": 1,
+            "trackNumber": 1,
+        },
+    ]
+    session = FakeSession([{"results": lookup_rows}])
+    client = AppleCatalogClient(
+        cache_dir=tmp_path / "cache",
+        session=session,
+        musicbrainz_client=musicbrainz,
+        api_interval=0,
+    )
+
+    albums = client.find_candidates(group)
+
+    assert [album.collection_id for album in albums] == [99]
+    assert albums[0].verified_barcode == "012345678905"
+    assert albums[0].verified_musicbrainz_release_id == group.musicbrainz_release_id
+    assert albums[0].identifier_resolution == "musicbrainz_barcode"
     assert session.calls[0][1]["upc"] == "012345678905"
 
 

@@ -19,8 +19,22 @@ def _candidate_score_report(score: CandidateScore) -> dict[str, object]:
         "artist": score.candidate.artist,
         "album": score.candidate.album,
         "score": round(score.total, 6),
+        "match_basis": score.match_basis,
         "eligible": score.eligible,
         "reasons": list(score.reasons),
+        "warnings": list(score.warnings),
+        "verified_barcode": score.candidate.verified_barcode,
+        "verified_musicbrainz_release_id": (score.candidate.verified_musicbrainz_release_id),
+        "identifier_resolution": score.candidate.identifier_resolution,
+        "musicbrainz_recordings_verified": score.candidate.musicbrainz_recordings_verified,
+        "resolved_musicbrainz_title": score.candidate.resolved_musicbrainz_title,
+        "resolved_musicbrainz_artist": score.candidate.resolved_musicbrainz_artist,
+        "resolved_musicbrainz_track_count": score.candidate.resolved_musicbrainz_track_count,
+        "resolved_musicbrainz_release_year": score.candidate.resolved_musicbrainz_release_year,
+        "musicbrainz_search_track_count": score.candidate.musicbrainz_search_track_count,
+        "musicbrainz_search_track_count_source": (
+            score.candidate.musicbrainz_search_track_count_source
+        ),
         "components": {name: round(value, 6) for name, value in score.components.items()},
     }
 

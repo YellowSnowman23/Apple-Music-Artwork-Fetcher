@@ -25,6 +25,8 @@ class TrackMetadata:
     barcode: str | None = None
     musicbrainz_release_id: str | None = None
     source_identity: tuple[int, int, int, int, int] | None = None
+    musicbrainz_recording_id: str | None = None
+    identifier_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +39,9 @@ class AlbumGroup:
     barcode: str | None = None
     musicbrainz_release_id: str | None = None
     source_identities: tuple[tuple[Path, tuple[int, int, int, int, int]], ...] = ()
+    musicbrainz_provenance_complete: bool = False
+    identifier_conflicts: tuple[str, ...] = ()
+    identifier_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +63,27 @@ class CatalogAlbum:
     track_count: int | None
     tracks: tuple[CatalogTrack, ...]
     verified_barcode: str | None = None
+    verified_musicbrainz_release_id: str | None = None
+    identifier_resolution: str | None = None
+    musicbrainz_recordings_verified: bool = False
+    resolved_musicbrainz_title: str | None = None
+    resolved_musicbrainz_artist: str | None = None
+    resolved_musicbrainz_track_count: int | None = None
+    resolved_musicbrainz_release_year: int | None = None
+    musicbrainz_search_track_count: int | None = None
+    musicbrainz_search_track_count_source: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MusicBrainzRelease:
+    release_id: str
+    title: str
+    artist: str
+    release_year: int | None
+    track_count: int | None
+    barcode: str | None
+    apple_collection_ids: tuple[int, ...] = ()
+    recording_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +93,8 @@ class CandidateScore:
     eligible: bool
     reasons: tuple[str, ...]
     components: Mapping[str, float]
+    match_basis: str = "legacy"
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,5 +165,6 @@ __all__ = (
     "EmbedError",
     "EmbedResult",
     "MatchDecision",
+    "MusicBrainzRelease",
     "TrackMetadata",
 )

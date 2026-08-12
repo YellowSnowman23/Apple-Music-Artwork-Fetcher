@@ -1,6 +1,9 @@
 import ast
+import re
 from importlib import import_module
 from pathlib import Path
+
+import pytest
 
 import apple_artwork
 import apple_music_artwork
@@ -8,7 +11,8 @@ from apple_music_artwork.adapters import ADAPTERS
 from apple_music_artwork.adapters.base import FormatAdapter
 from apple_music_artwork.artwork import ArtworkDownloader
 from apple_music_artwork.catalog import AppleCatalogClient
-from apple_music_artwork.constants import VERSION
+from apple_music_artwork.cli import main
+from apple_music_artwork.constants import REPORT_SCHEMA_VERSION, USER_AGENT, VERSION
 
 MODULES = (
     "artwork",
@@ -20,6 +24,7 @@ MODULES = (
     "matching",
     "metadata",
     "models",
+    "musicbrainz",
     "mutagen_io",
     "network",
     "pipeline",
@@ -73,6 +78,21 @@ def test_network_clients_identify_current_release(tmp_path: Path) -> None:
     AppleCatalogClient(cache_dir=tmp_path, session=catalog_session)
     ArtworkDownloader(cache_dir=tmp_path, session=artwork_session)
 
-    expected = f"AppleMusicArtworkEmbedder/{VERSION} (+local library tool)"
-    assert catalog_session.headers["User-Agent"] == expected
-    assert artwork_session.headers["User-Agent"] == expected
+    assert catalog_session.headers["User-Agent"] == USER_AGENT
+    assert artwork_session.headers["User-Agent"] == USER_AGENT
+
+
+def test_release_version_is_consistent_with_project_metadata() -> None:
+    project_text = (Path(apple_music_artwork.__file__).parent.parent / "pyproject.toml").read_text()
+    project_version = re.search(r'^version = "([^"]+)"$', project_text, re.MULTILINE)
+
+    assert project_version is not None
+    assert project_version.group(1) == VERSION == "3.0.0"
+    assert REPORT_SCHEMA_VERSION == 3
+
+
+def test_cli_reports_current_release(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit, match="0"):
+        main(["--version"])
+
+    assert capsys.readouterr().out == f"apple-artwork {VERSION}\n"

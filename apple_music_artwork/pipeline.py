@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .artwork import ArtworkDownloader
 from .catalog import AppleCatalogClient
+from .constants import REPORT_SCHEMA_VERSION, VERSION
 from .embedding import (
     _verify_group_sources,
     embed_artwork,
@@ -17,7 +18,7 @@ from .embedding import (
     recover_transaction_journals,
 )
 from .filesystem import _open_secure_directory
-from .matching import choose_match
+from .matching import choose_match, matching_basis
 from .metadata import (
     _terminal_safe,
     discover_audio_files,
@@ -178,7 +179,8 @@ def process_library(
         _write_json_report(
             report_destination,
             {
-                "schema_version": 2,
+                "schema_version": REPORT_SCHEMA_VERSION,
+                "program_version": VERSION,
                 "status": "in_progress",
                 "mode": "apply" if apply else "dry-run",
                 "root": str(root),
@@ -258,6 +260,8 @@ def process_library(
         "metadata_tracks": len(tracks),
         "albums": len(groups),
         "matched": 0,
+        "matched_by_identifier": 0,
+        "matched_by_legacy": 0,
         "ambiguous": 0,
         "low_confidence": 0,
         "no_match": 0,
@@ -287,7 +291,8 @@ def process_library(
             _write_json_report(
                 report_destination,
                 {
-                    "schema_version": 2,
+                    "schema_version": REPORT_SCHEMA_VERSION,
+                    "program_version": VERSION,
                     "status": "in_progress",
                     "mode": "apply" if apply else "dry-run",
                     "root": str(root),
@@ -353,6 +358,10 @@ def process_library(
             "logical_track_count": len(group.logical_tracks),
             "barcode": group.barcode,
             "musicbrainz_release_id": group.musicbrainz_release_id,
+            "musicbrainz_provenance_complete": group.musicbrainz_provenance_complete,
+            "identifier_conflicts": list(group.identifier_conflicts),
+            "identifier_warnings": list(group.identifier_warnings),
+            "match_basis": matching_basis(group),
         }
         blocked_files = [path for path in group.files if path in adapter_errors]
         if blocked_files:
@@ -384,6 +393,17 @@ def process_library(
         try:
             _verify_group_sources(group)
             candidates = catalog.find_candidates(group)  # type: ignore[attr-defined]
+            identifier_warnings = tuple(
+                dict.fromkeys(
+                    (
+                        *group.identifier_warnings,
+                        *(
+                            str(warning)
+                            for warning in getattr(catalog, "last_identifier_warnings", ())
+                        ),
+                    )
+                )
+            )
             _verify_group_sources(group)
             decision = choose_match(
                 group,
@@ -403,10 +423,15 @@ def process_library(
             say(f"ERROR   {label}: Apple lookup failed: {exc}")
             continue
 
+        base_report["identifier_warnings"] = list(identifier_warnings)
+        for warning in identifier_warnings:
+            detail(f"IDENTIFIER-WARNING {label}: {warning}")
+
         for score in decision.scores:
             reasons = "; ".join(score.reasons) or "none"
             detail(
                 f"CANDIDATE {label} collection_id={score.candidate.collection_id} "
+                f"basis={score.match_basis} "
                 f"eligible={str(score.eligible).lower()} score={score.total:.3f} "
                 f"reasons={reasons}"
             )
@@ -423,6 +448,10 @@ def process_library(
 
         summary["matched"] += 1
         matched = decision.match
+        if matched.match_basis == "legacy":
+            summary["matched_by_legacy"] += 1
+        else:
+            summary["matched_by_identifier"] += 1
         candidate = matched.candidate
         base_report["apple"] = {
             "collection_id": candidate.collection_id,
@@ -432,6 +461,20 @@ def process_library(
             "track_count": candidate.track_count,
             "artwork_url": candidate.artwork_url,
             "score": round(matched.total, 6),
+            "match_basis": matched.match_basis,
+            "warnings": list(matched.warnings),
+            "verified_barcode": candidate.verified_barcode,
+            "verified_musicbrainz_release_id": candidate.verified_musicbrainz_release_id,
+            "identifier_resolution": candidate.identifier_resolution,
+            "musicbrainz_recordings_verified": candidate.musicbrainz_recordings_verified,
+            "resolved_musicbrainz_title": candidate.resolved_musicbrainz_title,
+            "resolved_musicbrainz_artist": candidate.resolved_musicbrainz_artist,
+            "resolved_musicbrainz_track_count": candidate.resolved_musicbrainz_track_count,
+            "resolved_musicbrainz_release_year": candidate.resolved_musicbrainz_release_year,
+            "musicbrainz_search_track_count": candidate.musicbrainz_search_track_count,
+            "musicbrainz_search_track_count_source": (
+                candidate.musicbrainz_search_track_count_source
+            ),
         }
         if not apply:
             file_results: list[dict[str, str]] = []
@@ -623,7 +666,8 @@ def process_library(
                 summary["failed"] += 1
                 album_reports.append(base_report)
                 interrupted_report: dict[str, object] = {
-                    "schema_version": 2,
+                    "schema_version": REPORT_SCHEMA_VERSION,
+                    "program_version": VERSION,
                     "status": "interrupted_committed",
                     "mode": "apply",
                     "root": str(root),
@@ -688,7 +732,8 @@ def process_library(
         checkpoint_report()
 
     report: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "program_version": VERSION,
         "status": "complete",
         "mode": "apply" if apply else "dry-run",
         "root": str(root),

@@ -1,4 +1,4 @@
-"""Accuracy-first Apple Music artwork matching and embedding."""
+"""Identifier-first Apple Music artwork matching and embedding."""
 
 from .artwork import ArtworkDownloader, build_artwork_urls, decode_artwork
 from .catalog import (
@@ -10,7 +10,7 @@ from .catalog import (
 from .cli import main
 from .constants import VERSION
 from .embedding import embed_artwork, preflight_artwork
-from .matching import choose_match, normalize_text, score_candidate, text_similarity
+from .matching import choose_match, matching_basis, normalize_text, score_candidate, text_similarity
 from .metadata import discover_audio_files, group_tracks, read_track_metadata
 from .models import (
     AlbumGroup,
@@ -24,8 +24,10 @@ from .models import (
     EmbedError,
     EmbedResult,
     MatchDecision,
+    MusicBrainzRelease,
     TrackMetadata,
 )
+from .musicbrainz import MusicBrainzClient, parse_musicbrainz_release
 from .pipeline import process_library
 
 __all__ = (
@@ -43,6 +45,8 @@ __all__ = (
     "EmbedError",
     "EmbedResult",
     "MatchDecision",
+    "MusicBrainzClient",
+    "MusicBrainzRelease",
     "TrackMetadata",
     "build_artwork_urls",
     "candidate_ids_from_album_search",
@@ -54,7 +58,9 @@ __all__ = (
     "embed_artwork",
     "group_tracks",
     "main",
+    "matching_basis",
     "normalize_text",
+    "parse_musicbrainz_release",
     "preflight_artwork",
     "process_library",
     "read_track_metadata",

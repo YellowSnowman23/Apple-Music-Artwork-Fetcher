@@ -7,7 +7,7 @@ import re
 import unicodedata
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -65,6 +65,36 @@ def _artists_equivalent(left: str, right: str) -> bool:
         if base != "the" and base == left_identity:
             return True
     return False
+
+
+def _artist_credit_extends_base(credit: str, base: str) -> bool:
+    credit_identity = _artist_identity(credit)
+    base_identity = _artist_identity(base)
+    if not credit_identity or not base_identity:
+        return False
+    if credit_identity == base_identity:
+        return True
+    credit_folded = unicodedata.normalize("NFKD", credit).casefold().strip()
+    base_folded = unicodedata.normalize("NFKD", base).casefold().strip()
+    if credit_folded.startswith(base_folded):
+        suffix = credit_folded[len(base_folded) :]
+        if re.match(
+            r"^\s*(?:,|&|\b(?:and|feat(?:uring)?|ft|with|x)\b)",
+            suffix,
+        ):
+            return True
+    return any(
+        credit_identity.startswith(f"{base_identity} {separator} ")
+        for separator in ("and", "feat", "featuring", "ft", "with", "x")
+    )
+
+
+def _musicbrainz_album_artists_compatible(left: str, right: str) -> bool:
+    return (
+        _artists_equivalent(left, right)
+        or _artist_credit_extends_base(left, right)
+        or _artist_credit_extends_base(right, left)
+    )
 
 
 def _version_qualifiers(value: str) -> frozenset[str]:
@@ -132,28 +162,269 @@ def _without_trailing_album_version(value: str) -> str:
     )
 
 
-def _title_similarity(left: str, right: str) -> float:
-    def without_feature(value: str) -> str:
-        normalized = normalize_text(value)
-        return re.split(r"\b(?:feat|featuring|ft)\b", normalized, maxsplit=1)[0].strip()
+_EXPLICIT_FEATURE_MARKER = r"(?:(?:feat(?:uring)?|ft)\.?|w/)"
+_BRACKETED_FEATURE_MARKER = rf"(?:{_EXPLICIT_FEATURE_MARKER}|with)"
+_BRACKETED_FEATURE_START = re.compile(
+    rf"[\[(]\s*{_BRACKETED_FEATURE_MARKER}\s+",
+    flags=re.IGNORECASE,
+)
+_FEATURE_QUALIFIER_TEXT = (
+    r"(?:live|mono|stereo|acoustic|instrumental|radio\s+edit|demo|"
+    r"(?:[^\[\]()]{1,100}\s+)?remix|"
+    r"(?:digital\s+)?remaster(?:ed)?|album\s+version)"
+    r"(?:\s+(?:18|19|20|21)\d{2})?|"
+    r"(?:18|19|20|21)\d{2}\s+(?:digital\s+)?remaster(?:ed)?|"
+    r"bonus(?:\s+tracks?)?|explicit|clean"
+)
+_TRAILING_FEATURE_QUALIFIER = re.compile(
+    rf"\s*[-\u2010-\u2015]\s*(?P<label>{_FEATURE_QUALIFIER_TEXT})\s*$",
+    flags=re.IGNORECASE,
+)
+_TRAILING_BRACKETED_FEATURE_QUALIFIER = re.compile(
+    rf"\s*[\[(]\s*{_FEATURE_QUALIFIER_TEXT}\s*[\])]\s*$",
+    flags=re.IGNORECASE,
+)
+_TRAILING_SQUARE_PRESENTATION = re.compile(r"\s*\[[^\[\]]+\]\s*$")
+_UNBRACKETED_FEATURE_START = re.compile(
+    rf"(?<!\w){_EXPLICIT_FEATURE_MARKER}\s+",
+    flags=re.IGNORECASE,
+)
 
+
+def _bracketed_feature_credits(
+    value: str,
+) -> tuple[tuple[int, int, str, str | None], ...]:
+    """Return balanced bracketed explicit credits; ignore malformed unbalanced spans."""
+    if len(value) > 4096:
+        return ()
+    credits: list[tuple[int, int, str, str | None]] = []
+    for match in _BRACKETED_FEATURE_START.finditer(value):
+        opener_index = match.start()
+        if any(start <= opener_index < end for start, end, _content, _qualifier in credits):
+            continue
+        opener = value[opener_index]
+        closer = "]" if opener == "[" else ")"
+        stack = [closer]
+        cursor = match.end()
+        while cursor < len(value) and stack:
+            char = value[cursor]
+            if char == "[":
+                stack.append("]")
+            elif char == "(":
+                stack.append(")")
+            elif char in "])":
+                if char != stack[-1]:
+                    break
+                stack.pop()
+            cursor += 1
+        if stack:
+            continue
+        content = value[match.end() : cursor - 1].strip()
+        qualifier_match = _TRAILING_FEATURE_QUALIFIER.search(content)
+        qualifier = qualifier_match.group("label") if qualifier_match else None
+        if qualifier_match:
+            content = content[: qualifier_match.start()].strip()
+        if content:
+            credits.append((opener_index, cursor, content, qualifier))
+    return tuple(credits)
+
+
+def _inside_unclosed_bracket(value: str, position: int) -> bool:
+    stack: list[str] = []
+    for char in value[:position]:
+        if char == "[":
+            stack.append("]")
+        elif char == "(":
+            stack.append(")")
+        elif char in "])":
+            if not stack or stack[-1] != char:
+                return True
+            stack.pop()
+    return bool(stack)
+
+
+def _unbracketed_feature_credits(
+    value: str,
+    bracketed_spans: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int, str, str | None], ...]:
+    if len(value) > 4096:
+        return ()
+    credits: list[tuple[int, int, str, str | None]] = []
+    for match in _UNBRACKETED_FEATURE_START.finditer(value):
+        if any(
+            start <= match.start() < end for start, end in bracketed_spans
+        ) or _inside_unclosed_bracket(value, match.start()):
+            continue
+        content_end = len(value)
+        span_end = len(value)
+        qualifier: str | None = None
+        tail = value[match.end() :]
+        qualifier_match = _TRAILING_FEATURE_QUALIFIER.search(tail)
+        if qualifier_match:
+            content_end = match.end() + qualifier_match.start()
+            qualifier = qualifier_match.group("label")
+        else:
+            presentation_match = _TRAILING_BRACKETED_FEATURE_QUALIFIER.search(tail)
+            square_match = _TRAILING_SQUARE_PRESENTATION.search(tail)
+            boundary = presentation_match or square_match
+            if boundary:
+                content_end = match.end() + boundary.start()
+                span_end = content_end
+        content = value[match.end() : content_end].strip()
+        if content:
+            credits.append((match.start(), span_end, content, qualifier))
+    return tuple(credits)
+
+
+def _explicit_feature_credits(
+    value: str,
+) -> tuple[tuple[int, int, str, str | None], ...]:
+    bracketed = _bracketed_feature_credits(value)
+    bracketed_spans = tuple((start, end) for start, end, _content, _qualifier in bracketed)
+    return bracketed + _unbracketed_feature_credits(value, bracketed_spans)
+
+
+def _without_feature_credit(value: str) -> str:
+    """Remove a feature-credit annotation without dropping later title qualifiers."""
+    for start, end, _content, qualifier in sorted(
+        _explicit_feature_credits(value),
+        reverse=True,
+    ):
+        prefix_start = start
+        while prefix_start > 0 and value[prefix_start - 1].isspace():
+            prefix_start -= 1
+        replacement = f" [{qualifier}]" if qualifier else ""
+        value = value[:prefix_start] + replacement + value[end:]
+    return value.strip()
+
+
+def _collaborator_identities(value: str) -> frozenset[str]:
+    separated = unicodedata.normalize("NFKD", value).casefold()
+    separated = re.sub(
+        rf"\s+{_EXPLICIT_FEATURE_MARKER}\s+",
+        "\0",
+        separated,
+        flags=re.IGNORECASE,
+    )
+    separated = re.sub(r"\s*(?:,|;|&|\+)\s*", "\0", separated)
+    separated = re.sub(r"\s+\b(?:and|with|x)\b\s+", "\0", separated)
+    return frozenset(
+        identity for part in separated.split("\0") if (identity := normalize_text(part))
+    )
+
+
+def _feature_credit_identities(*values: str) -> frozenset[str]:
+    identities: set[str] = set()
+    for value in values:
+        value = _TRAILING_APPLE_RELEASE_TYPE.sub("", value).rstrip()
+        for _start, _end, content, _qualifier in _explicit_feature_credits(value):
+            identities.update(_collaborator_identities(content))
+    return frozenset(identities)
+
+
+_UNMARKED_ARTIST_COLLABORATOR_DELIMITER = re.compile(
+    r"\s*[,;&+]\s*|\s+(?:and|x)\s+",
+    flags=re.IGNORECASE,
+)
+
+
+def _unmarked_artist_suffix_matches_explicit_features(
+    primary_artist: str,
+    candidate_artist: str,
+    explicit_features: frozenset[str],
+) -> bool:
+    """Reconcile a known feature set with one delimiter-marked Apple artist suffix."""
+    if not explicit_features:
+        return False
+    for delimiter in _UNMARKED_ARTIST_COLLABORATOR_DELIMITER.finditer(candidate_artist):
+        candidate_base = candidate_artist[: delimiter.start()].strip()
+        candidate_suffix = candidate_artist[delimiter.end() :].strip()
+        if (
+            candidate_base
+            and candidate_suffix
+            and _artists_equivalent(primary_artist, candidate_base)
+            and _collaborator_identities(candidate_suffix) == explicit_features
+        ):
+            return True
+    return False
+
+
+def _musicbrainz_search_artist_and_features_match(
+    title: str,
+    artist: str,
+    candidate_title: str,
+    candidate_artist: str,
+) -> bool:
+    left = _feature_credit_identities(title, artist)
+    right = _feature_credit_identities(candidate_title, candidate_artist)
+    left_base = _without_feature_credit(artist)
+    right_base = _without_feature_credit(candidate_artist)
+    if _artists_equivalent(left_base, right_base) and left == right:
+        return True
+    if (
+        left
+        and left == right
+        and _unmarked_artist_suffix_matches_explicit_features(
+            left_base,
+            candidate_artist,
+            left,
+        )
+    ):
+        return True
+    return bool(
+        left
+        and not right
+        and _unmarked_artist_suffix_matches_explicit_features(
+            left_base,
+            candidate_artist,
+            left,
+        )
+    )
+
+
+def _normalize_colloquial_ing(value: str) -> str:
+    return re.sub(
+        r"\b([^\W\d_]+)in[\u2019'](?=$|[^\w])",
+        r"\1ing",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
+def _title_similarity(left: str, right: str) -> float:
     left_without_version = _without_trailing_album_version(left)
     right_without_version = _without_trailing_album_version(right)
+    left_without_feature = _without_feature_credit(left)
+    right_without_feature = _without_feature_credit(right)
+    left_canonical_style = _normalize_colloquial_ing(left_without_feature)
+    right_canonical_style = _normalize_colloquial_ing(right_without_feature)
     return max(
         text_similarity(left, right),
-        text_similarity(without_feature(left), without_feature(right)),
+        text_similarity(left_without_feature, right_without_feature),
         text_similarity(left_without_version, right_without_version),
         text_similarity(
-            without_feature(left_without_version),
-            without_feature(right_without_version),
+            _without_feature_credit(left_without_version),
+            _without_feature_credit(right_without_version),
         ),
+        text_similarity(left_canonical_style, right_canonical_style),
     )
 
 
 def _canonical_track_identity(value: str) -> str:
     value = _without_trailing_album_version(value)
-    normalized = normalize_text(value)
-    return re.split(r"\b(?:feat|featuring|ft)\b", normalized, maxsplit=1)[0].strip()
+    value = _without_feature_credit(value)
+    value = _normalize_colloquial_ing(value)
+    return normalize_text(value)
+
+
+def _musicbrainz_track_identity(value: str) -> str:
+    """Normalize a provider's redundant ``Acoustic Version``-style wording."""
+    identity = _canonical_track_identity(value)
+    return re.sub(
+        r"\b(acoustic|instrumental|live|mono|stereo|demo|radio edit|remix) version$",
+        r"\1",
+        identity,
+    )
 
 
 _TRAILING_REMASTER = re.compile(
@@ -308,6 +579,28 @@ _TRAILING_ALBUM_NICKNAME = re.compile(
     flags=re.IGNORECASE,
 )
 
+_TRAILING_APPLE_RELEASE_TYPE = re.compile(
+    r"\s*[-\u2010-\u2015]\s*(?:single|ep)\s*$",
+    flags=re.IGNORECASE,
+)
+
+_TRAILING_IDENTIFIER_PRESENTATION = re.compile(
+    r"\s*[\[(]\s*"
+    r"(?:(?:expanded|deluxe)(?:\s+edition)?|explicit|clean|"
+    r"bonus(?:\s+tracks?)?(?:\s+version)?|album\s+version)"
+    r"(?:\s*[-\u2010-\u2015,/&+]\s*(?:(?:expanded|deluxe)(?:\s+edition)?|explicit|clean|"
+    r"bonus(?:\s+tracks?)?(?:\s+version)?|album\s+version))*"
+    r"\s*[\])]\s*$",
+    flags=re.IGNORECASE,
+)
+
+_TRAILING_DASH_IDENTIFIER_PRESENTATION = re.compile(
+    r"\s*[-\u2010-\u2015]\s*"
+    r"(?:(?:expanded|deluxe)(?:\s+edition)?|explicit|clean|"
+    r"bonus(?:\s+tracks?)?(?:\s+version)?|album\s+version)\s*$",
+    flags=re.IGNORECASE,
+)
+
 
 def _strip_track_release_label(value: str) -> tuple[str, bool]:
     """Remove only trailing mastering labels that do not change a song's identity."""
@@ -392,6 +685,206 @@ def _release_album_names_related(left: str, right: str) -> tuple[bool, bool]:
     return related, left_changed or right_changed or nickname_equivalent
 
 
+def _musicbrainz_album_identity(value: str) -> str:
+    value = _TRAILING_APPLE_RELEASE_TYPE.sub("", value).rstrip()
+    while True:
+        stripped = _TRAILING_IDENTIFIER_PRESENTATION.sub("", value).rstrip()
+        stripped = _TRAILING_DASH_IDENTIFIER_PRESENTATION.sub("", stripped).rstrip()
+        remaster = _split_trailing_remaster(stripped)
+        if remaster is not None:
+            stripped = remaster[0]
+        else:
+            stripped = re.sub(
+                r"\s*[-\u2010-\u2015]\s*"
+                r"(?:(?:18|19|20|21)\d{2}\s+)?(?:digital\s+)?"
+                r"remaster(?:ed)?(?:\s+(?:18|19|20|21)\d{2})?\s*$",
+                "",
+                stripped,
+                flags=re.IGNORECASE,
+            ).rstrip()
+        if stripped == value:
+            break
+        value = stripped
+    value = _without_feature_credit(value)
+    value = _strip_album_release_label(value)[0]
+    normalized = normalize_text(value)
+    return re.sub(r"\bvolume\b", "vol", normalized)
+
+
+def _duplicate_track_title_identity(value: str) -> str:
+    """Normalize only provider presentation that cannot distinguish duplicate encodes."""
+    value = _without_feature_credit(value)
+    value = _strip_track_release_label(value)[0]
+    presentation = re.compile(
+        r"\s*[\[(]\s*(?:explicit|clean|bonus(?:\s+tracks?)?)\s*[\])]\s*$",
+        flags=re.IGNORECASE,
+    )
+    while True:
+        stripped = presentation.sub("", value).rstrip()
+        if stripped == value:
+            return normalize_text(value)
+        value = stripped
+
+
+def _duplicate_track_presentations_compatible(
+    left: TrackMetadata,
+    right: TrackMetadata,
+) -> bool:
+    if _duplicate_track_title_identity(left.title) != _duplicate_track_title_identity(right.title):
+        return False
+    left_features = _feature_credit_identities(left.title, left.artist)
+    right_features = _feature_credit_identities(right.title, right.artist)
+    return not left_features or not right_features or left_features == right_features
+
+
+def _musicbrainz_search_identity_matches(
+    title: str,
+    artist: str,
+    track_count: int | None,
+    candidate_title: str,
+    candidate_artist: str,
+    candidate_track_count: int | None,
+    release_year: int | None = None,
+    candidate_release_year: int | None = None,
+) -> bool:
+    """Require an inferred Apple search result to preserve resolved MB identity."""
+    title_without_features = _without_feature_credit(title)
+    candidate_title_without_features = _without_feature_credit(candidate_title)
+    if (
+        _musicbrainz_album_identity(title) != _musicbrainz_album_identity(candidate_title)
+        or not _musicbrainz_search_artist_and_features_match(
+            title,
+            artist,
+            candidate_title,
+            candidate_artist,
+        )
+        or (_semantic_qualifiers(title_without_features) - {"bonus"})
+        != (_semantic_qualifiers(candidate_title_without_features) - {"bonus"})
+        or _explicit_remaster_years_conflict(
+            title_without_features,
+            candidate_title_without_features,
+        )
+    ):
+        return False
+    return bool(
+        track_count is not None
+        and candidate_track_count is not None
+        and track_count == candidate_track_count
+        and not (
+            release_year is not None
+            and candidate_release_year is not None
+            and abs(release_year - candidate_release_year) > 1
+        )
+    )
+
+
+def _has_complete_musicbrainz_provenance(group: AlbumGroup) -> bool:
+    release_id = _normalize_release_id(group.musicbrainz_release_id)
+    return bool(
+        group.musicbrainz_provenance_complete
+        and release_id
+        and group.logical_tracks
+        and all(
+            _normalize_release_id(track.musicbrainz_release_id) == release_id
+            and _normalize_release_id(track.musicbrainz_recording_id) is not None
+            for track in group.logical_tracks
+        )
+    )
+
+
+def _musicbrainz_track_artists_compatible(
+    group: AlbumGroup,
+    candidate: CatalogAlbum,
+    local: TrackMetadata,
+    remote: CatalogTrack,
+) -> bool:
+    if _artists_equivalent(local.artist, remote.artist):
+        return True
+    if not _musicbrainz_album_artists_compatible(group.album_artist, candidate.artist):
+        return False
+    return _artist_credit_extends_base(local.artist, group.album_artist) and (
+        _artist_credit_extends_base(remote.artist, candidate.artist)
+    )
+
+
+def _positions_are_sequential(positions: tuple[tuple[int, int], ...]) -> bool:
+    by_disc: dict[int, list[int]] = defaultdict(list)
+    for disc, number in positions:
+        by_disc[disc].append(number)
+    return set(by_disc) == set(range(1, max(by_disc, default=0) + 1)) and all(
+        sorted(numbers) == list(range(1, len(numbers) + 1)) for numbers in by_disc.values()
+    )
+
+
+def _trusted_musicbrainz_alignment(
+    group: AlbumGroup,
+    candidate: CatalogAlbum,
+) -> Mapping[tuple[int, int], tuple[int, int]]:
+    """Prove an Apple release against a completely Picard-identified local release."""
+    local_tracks = group.logical_tracks
+    remote_tracks = candidate.tracks
+    if (
+        not _has_complete_musicbrainz_provenance(group)
+        or len(local_tracks) != len(remote_tracks)
+        or candidate.track_count != len(remote_tracks)
+        or _local_tracklist_incomplete(group)
+        or not _musicbrainz_album_artists_compatible(group.album_artist, candidate.artist)
+        or _musicbrainz_album_identity(group.album) != _musicbrainz_album_identity(candidate.album)
+        or _semantic_qualifiers(group.album) != _semantic_qualifiers(candidate.album)
+        or _explicit_remaster_years_conflict(group.album, candidate.album)
+    ):
+        return {}
+    local_positions = _complete_positions(local_tracks)
+    remote_positions = _complete_positions(remote_tracks)
+    if local_positions is None or remote_positions is None:
+        return {}
+    if local_positions == remote_positions:
+        alignment = {position: position for position in local_positions}
+    else:
+        local_barcode = _normalize_barcode(group.barcode)
+        verified_barcode = _normalize_barcode(candidate.verified_barcode)
+        local_discs = {disc for disc, _number in local_positions}
+        remote_discs = {disc for disc, _number in remote_positions}
+        if (
+            local_barcode is None
+            or not _barcodes_equivalent(local_barcode, verified_barcode)
+            or not _positions_are_sequential(local_positions)
+            or not _positions_are_sequential(remote_positions)
+            or (len(local_discs) == 1) == (len(remote_discs) == 1)
+        ):
+            return {}
+        alignment = dict(zip(local_positions, remote_positions, strict=True))
+
+    local_by_position = {
+        (track.disc_number or 1, track.track_number): track for track in local_tracks
+    }
+    remote_by_position = {
+        (track.disc_number or 1, track.track_number): track for track in remote_tracks
+    }
+    compatible_durations = 0
+    for local_position, remote_position in alignment.items():
+        local = local_by_position[local_position]
+        remote = remote_by_position[remote_position]
+        if (
+            _musicbrainz_track_identity(local.title) != _musicbrainz_track_identity(remote.title)
+            or _version_qualifiers(local.title) != _version_qualifiers(remote.title)
+            or not _musicbrainz_track_artists_compatible(group, candidate, local, remote)
+            or local.duration_ms is None
+            or remote.duration_ms is None
+        ):
+            return {}
+        if _duration_similarity(local.duration_ms, remote.duration_ms) > 0:
+            compatible_durations += 1
+            continue
+        difference = abs(local.duration_ms - remote.duration_ms)
+        maximum_drift = max(10_000.0, max(local.duration_ms, remote.duration_ms) * 0.03)
+        if difference > maximum_drift:
+            return {}
+    if compatible_durations < math.ceil(0.85 * len(local_tracks)):
+        return {}
+    return alignment
+
+
 def _aligned_release_label_positions(
     group: AlbumGroup,
     candidate: CatalogAlbum,
@@ -468,7 +961,9 @@ def _match_tracks(
     remote_tracks: tuple[CatalogTrack, ...],
     *,
     aligned_release_positions: frozenset[tuple[int, int]] = frozenset(),
+    trusted_musicbrainz_alignment: Mapping[tuple[int, int], tuple[int, int]] | None = None,
 ) -> list[tuple[TrackMetadata, CatalogTrack, float, float, float]]:
+    musicbrainz_alignment = trusted_musicbrainz_alignment or {}
     strip_local_remaster, strip_remote_remaster = _provider_omitted_uniform_remaster(
         local_tracks, remote_tracks
     )
@@ -485,6 +980,9 @@ def _match_tracks(
             aligned_release_pair = (
                 local_position == remote_position and local_position in aligned_release_positions
             )
+            trusted_musicbrainz_pair = musicbrainz_alignment.get(local_position) == remote_position
+            if musicbrainz_alignment and not trusted_musicbrainz_pair:
+                continue
             if aligned_release_pair:
                 local_title = _strip_track_release_label(local_title)[0]
                 remote_title = _strip_track_release_label(remote_title)[0]
@@ -504,10 +1002,17 @@ def _match_tracks(
                 assert parsed_remote is not None
                 remote_title = parsed_remote[0]
             title_score = _title_similarity(local_title, remote_title)
-            duration_score = _duration_similarity(local.duration_ms, remote.duration_ms)
-            if local_position == remote_position and _canonical_track_identity(
+            if trusted_musicbrainz_pair and _musicbrainz_track_identity(
                 local_title
-            ) != _canonical_track_identity(remote_title):
+            ) == _musicbrainz_track_identity(remote_title):
+                title_score = 1.0
+            duration_score = _duration_similarity(local.duration_ms, remote.duration_ms)
+            if (
+                local_position == remote_position
+                and not trusted_musicbrainz_pair
+                and _canonical_track_identity(local_title)
+                != _canonical_track_identity(remote_title)
+            ):
                 continue
             if title_score < 0.93 or _has_version_conflict(local_title, remote_title):
                 continue
@@ -516,9 +1021,12 @@ def _match_tracks(
                 and remote.duration_ms is not None
                 and duration_score == 0
                 and not aligned_release_pair
+                and not trusted_musicbrainz_pair
             ):
                 continue
-            position_score = _position_similarity(local, remote)
+            position_score = (
+                1.0 if trusted_musicbrainz_pair else _position_similarity(local, remote)
+            )
             pair_score = 0.74 * title_score + 0.16 * duration_score + 0.10 * position_score
             possible.append(
                 (
@@ -606,19 +1114,288 @@ def _normalize_barcode(value: str | None) -> str | None:
         int(digit) * (3 if (len(compact) - index) % 2 == 0 else 1)
         for index, digit in enumerate(compact)
     )
-    return compact if checksum % 10 == 0 else None
+    return compact if checksum % 10 == 0 and int(compact) != 0 else None
+
+
+def _barcode_equivalence_key(value: str | None) -> str | None:
+    normalized = _normalize_barcode(value)
+    return normalized.zfill(14) if normalized is not None else None
+
+
+def _barcodes_equivalent(left: str | None, right: str | None) -> bool:
+    left_key = _barcode_equivalence_key(left)
+    return left_key is not None and left_key == _barcode_equivalence_key(right)
 
 
 def _normalize_release_id(value: str | None) -> str | None:
     if not value:
         return None
     try:
-        return str(uuid.UUID(value.strip()))
+        parsed = uuid.UUID(value.strip())
+        return str(parsed) if parsed.int != 0 else None
     except (ValueError, AttributeError):
         return None
 
 
-def score_candidate(
+def matching_basis(group: AlbumGroup) -> str:
+    """Return the v3 matching path selected by valid embedded identifiers."""
+    sources: list[str] = []
+    if _normalize_release_id(group.musicbrainz_release_id) is not None:
+        sources.append("musicbrainz")
+    if _normalize_barcode(group.barcode) is not None:
+        sources.append("upc")
+    return "+".join(sources) if sources else "legacy"
+
+
+def _identifier_duration_evidence(
+    local_tracks: tuple[TrackMetadata, ...],
+    remote_tracks: tuple[CatalogTrack, ...],
+) -> tuple[float, float, int]:
+    """Compare duration fingerprints as multisets so provider order is irrelevant."""
+    local_durations = sorted(
+        track.duration_ms for track in local_tracks if track.duration_ms is not None
+    )
+    remote_durations = sorted(
+        track.duration_ms for track in remote_tracks if track.duration_ms is not None
+    )
+    known_pairs = min(len(local_durations), len(remote_durations))
+    denominator = max(len(local_tracks), len(remote_tracks), 1)
+    if known_pairs == 0:
+        return 0.5, 0.0, 0
+
+    compatible = 0
+    closeness = 0.0
+    aggregate_distance = 0
+    for local_duration, remote_duration in zip(
+        local_durations[:known_pairs],
+        remote_durations[:known_pairs],
+        strict=True,
+    ):
+        difference = abs(local_duration - remote_duration)
+        tolerance = max(10_000.0, max(local_duration, remote_duration) * 0.03)
+        aggregate_distance += difference
+        if difference <= tolerance:
+            compatible += 1
+            closeness += 1.0 - 0.15 * (difference / tolerance)
+    return compatible / denominator, closeness / denominator, aggregate_distance
+
+
+def _identifier_presentation_warnings(
+    local_tracks: tuple[TrackMetadata, ...],
+    remote_tracks: tuple[CatalogTrack, ...],
+    *,
+    duration_coverage: float,
+) -> list[str]:
+    warnings: list[str] = []
+    local_positions = _complete_positions(local_tracks)
+    remote_positions = _complete_positions(remote_tracks)
+    if (
+        local_positions is not None
+        and remote_positions is not None
+        and local_positions != remote_positions
+    ):
+        warnings.append("disc/track topology difference ignored by identifier-first matching")
+
+    if len(local_tracks) != len(remote_tracks) or duration_coverage < 0.70:
+        return warnings
+    ordered_local = sorted(
+        local_tracks,
+        key=lambda track: (track.disc_number or 1, track.track_number or 0),
+    )
+    ordered_remote = sorted(
+        remote_tracks,
+        key=lambda track: (track.disc_number or 1, track.track_number or 0),
+    )
+    known_pairs = 0
+    position_matches = 0
+    for local, remote in zip(ordered_local, ordered_remote, strict=True):
+        if local.duration_ms is None or remote.duration_ms is None:
+            continue
+        known_pairs += 1
+        if _duration_similarity(local.duration_ms, remote.duration_ms) > 0:
+            position_matches += 1
+    if known_pairs and position_matches / known_pairs + 0.20 < duration_coverage:
+        warnings.append("track order difference ignored by identifier-first matching")
+    return warnings
+
+
+def _score_identifier_candidate(
+    group: AlbumGroup,
+    candidate: CatalogAlbum,
+) -> CandidateScore:
+    """Score Apple candidates using v3's identifier-first, order-agnostic policy."""
+    basis = matching_basis(group)
+    local_barcode = _normalize_barcode(group.barcode)
+    verified_barcode = _normalize_barcode(candidate.verified_barcode)
+    release_id = _normalize_release_id(group.musicbrainz_release_id)
+    candidate_release_id = _normalize_release_id(candidate.verified_musicbrainz_release_id)
+    verified_upc = _barcodes_equivalent(local_barcode, verified_barcode)
+    conflicting_upc = bool(
+        local_barcode
+        and verified_barcode
+        and not _barcodes_equivalent(local_barcode, verified_barcode)
+    )
+    musicbrainz_release = release_id is not None
+    verified_musicbrainz = bool(release_id and release_id == candidate_release_id)
+    conflicting_musicbrainz = bool(
+        release_id and candidate_release_id and release_id != candidate_release_id
+    )
+    musicbrainz_search = bool(
+        verified_musicbrainz
+        and candidate.identifier_resolution == "musicbrainz_search"
+        and candidate.resolved_musicbrainz_title
+        and candidate.resolved_musicbrainz_artist
+        and _musicbrainz_search_identity_matches(
+            candidate.resolved_musicbrainz_title,
+            candidate.resolved_musicbrainz_artist,
+            candidate.musicbrainz_search_track_count,
+            candidate.album,
+            candidate.artist,
+            candidate.track_count,
+            candidate.resolved_musicbrainz_release_year,
+            candidate.release_year,
+        )
+    )
+    direct_musicbrainz = bool(
+        verified_musicbrainz
+        and candidate.identifier_resolution in {"musicbrainz_apple_relation", "musicbrainz_barcode"}
+    )
+    direct_identifier = verified_upc or direct_musicbrainz
+    identifier_provenance = direct_identifier or musicbrainz_search
+    musicbrainz_complete = bool(musicbrainz_release and _has_complete_musicbrainz_provenance(group))
+
+    local_count = len(group.logical_tracks)
+    remote_song_count = len(candidate.tracks)
+    remote_count = candidate.track_count or remote_song_count
+    count_score = (
+        max(0.0, 1.0 - abs(local_count - remote_count) / max(local_count, remote_count, 1))
+        if remote_count
+        else 0.0
+    )
+    duration_coverage, duration_score, aggregate_distance = _identifier_duration_evidence(
+        group.logical_tracks,
+        candidate.tracks,
+    )
+    album_score = text_similarity(group.album, candidate.album)
+    artist_score = text_similarity(group.album_artist, candidate.artist)
+    album_identity_equal = _musicbrainz_album_identity(group.album) == _musicbrainz_album_identity(
+        candidate.album
+    )
+    artist_compatible = _musicbrainz_album_artists_compatible(
+        group.album_artist,
+        candidate.artist,
+    )
+    if group.year is None or candidate.release_year is None:
+        year_score = 0.5
+    else:
+        year_score = max(0.0, 1.0 - abs(group.year - candidate.release_year) / 10)
+
+    reasons: list[str] = []
+    warnings: list[str] = []
+    reasons.extend(group.identifier_conflicts)
+    if not identifier_provenance:
+        reasons.append("candidate lacks resolved identifier provenance")
+    if conflicting_upc:
+        reasons.append("barcode mismatch")
+    if conflicting_musicbrainz:
+        reasons.append("MusicBrainz release ID mismatch")
+    if remote_count != remote_song_count:
+        reasons.append("Apple tracklist appears incomplete")
+    if local_count != remote_count:
+        if direct_identifier:
+            warnings.append(
+                "track count difference ignored because the candidate is identifier-linked"
+            )
+        else:
+            reasons.append("identifier track count mismatch")
+    if direct_identifier and duration_coverage < 0.70:
+        warnings.append("duration-fingerprint difference ignored by direct identifier evidence")
+    warnings.extend(
+        _identifier_presentation_warnings(
+            group.logical_tracks,
+            candidate.tracks,
+            duration_coverage=duration_coverage,
+        )
+    )
+
+    # A UPC result is a direct Apple identifier link. A release MBID is not exposed by
+    # Apple, so MBID-only candidates still need coherent release-level metadata and an
+    # order-independent duration fingerprint. Track names and positions never gate this path.
+    if (
+        not direct_identifier
+        and identifier_provenance
+        and not conflicting_upc
+        and not conflicting_musicbrainz
+        and local_count == remote_count
+    ):
+        if not musicbrainz_search:
+            if not artist_compatible:
+                reasons.append("identifier candidate artist mismatch")
+            if not album_identity_equal and album_score < 0.35:
+                reasons.append("identifier candidate album mismatch")
+            elif not album_identity_equal:
+                warnings.append("album-title difference accepted during identifier reconciliation")
+        else:
+            if not artist_compatible:
+                warnings.append(
+                    "local artist-credit difference accepted using resolved MusicBrainz identity"
+                )
+            if not album_identity_equal:
+                warnings.append(
+                    "local album-title difference accepted using resolved MusicBrainz identity"
+                )
+        local_known = sum(track.duration_ms is not None for track in group.logical_tracks)
+        remote_known = sum(track.duration_ms is not None for track in candidate.tracks)
+        if min(local_known, remote_known) > 0 and duration_coverage < 0.70:
+            reasons.append("identifier duration fingerprint mismatch")
+    elif direct_identifier:
+        if not artist_compatible:
+            warnings.append("artist-credit difference ignored by direct identifier evidence")
+        if not album_identity_equal:
+            warnings.append("album-title difference ignored by direct identifier evidence")
+
+    components = {
+        "identifier": 1.0,
+        "verified_upc": float(verified_upc),
+        "verified_musicbrainz": float(verified_musicbrainz),
+        "musicbrainz_release": float(musicbrainz_release),
+        "musicbrainz_complete": float(musicbrainz_complete),
+        "musicbrainz_search": float(musicbrainz_search),
+        "recording_mbid_alignment": float(candidate.musicbrainz_recordings_verified),
+        "track_count": count_score,
+        "duration_multiset": duration_score,
+        "duration_coverage": duration_coverage,
+        "album": album_score,
+        "artist": artist_score,
+        "year": year_score,
+        "order_agnostic": 1.0,
+        "duration_distance": 1.0 / (1.0 + aggregate_distance / 1_000.0),
+    }
+    weights = {
+        "verified_upc": 0.30,
+        "verified_musicbrainz": 0.30,
+        "musicbrainz_release": 0.10,
+        "musicbrainz_complete": 0.03,
+        "recording_mbid_alignment": 0.02,
+        "track_count": 0.10,
+        "duration_multiset": 0.08,
+        "artist": 0.03,
+        "album": 0.03,
+        "year": 0.01,
+    }
+    total = sum(components[name] * weight for name, weight in weights.items())
+    return CandidateScore(
+        candidate=candidate,
+        total=total,
+        eligible=not reasons,
+        reasons=tuple(reasons),
+        components=components,
+        match_basis=basis,
+        warnings=tuple(warnings),
+    )
+
+
+def _score_legacy_candidate(
     group: AlbumGroup,
     candidate: CatalogAlbum,
     *,
@@ -626,12 +1403,14 @@ def score_candidate(
 ) -> CandidateScore:
     """Score a candidate with hard identity and tracklist gates before fuzzy ranking."""
     aligned_release_positions = _aligned_release_label_positions(group, candidate)
+    musicbrainz_alignment = _trusted_musicbrainz_alignment(group, candidate)
     album_score = text_similarity(group.album, candidate.album)
     artist_score = text_similarity(group.album_artist, candidate.artist)
     matches = _match_tracks(
         group.logical_tracks,
         candidate.tracks,
         aligned_release_positions=aligned_release_positions,
+        trusted_musicbrainz_alignment=musicbrainz_alignment,
     )
     local_count = len(group.logical_tracks)
     remote_song_count = len(candidate.tracks)
@@ -642,7 +1421,12 @@ def score_candidate(
     position_score = sum(match[4] for match in matches) / len(matches) if matches else 0.0
     track_artist_score = (
         sum(
-            float(_artists_equivalent(local.artist, remote.artist)) for local, remote, *_ in matches
+            float(
+                _musicbrainz_track_artists_compatible(group, candidate, local, remote)
+                if (local.disc_number or 1, local.track_number) in musicbrainz_alignment
+                else _artists_equivalent(local.artist, remote.artist)
+            )
+            for local, remote, *_ in matches
         )
         / len(matches)
         if matches
@@ -657,11 +1441,14 @@ def score_candidate(
         year_score = 0.5
     else:
         year_score = max(0.0, 1.0 - abs(group.year - candidate.release_year) / 5)
-    if aligned_release_positions:
+    if aligned_release_positions or musicbrainz_alignment:
         album_score = max(album_score, 0.95)
         year_score = max(year_score, 0.5)
+    if musicbrainz_alignment:
+        artist_score = max(artist_score, 0.95)
 
     reasons: list[str] = []
+    reasons.extend(group.identifier_conflicts)
     local_incomplete = _local_tracklist_incomplete(group)
     if local_incomplete:
         reasons.append("local tracklist appears incomplete")
@@ -674,6 +1461,7 @@ def score_candidate(
         and local_positions is not None
         and remote_positions is not None
         and local_positions != remote_positions
+        and not musicbrainz_alignment
     ):
         reasons.append("disc/track topology mismatch")
     if matches and any(match[4] < 1.0 for match in matches):
@@ -688,16 +1476,20 @@ def score_candidate(
         len(matches) != local_count or any(match[4] < 1.0 for match in matches)
     ):
         reasons.append("positioned tracklist mismatch")
-    if _has_version_conflict(group.album, candidate.album) and not aligned_release_positions:
+    if (
+        _has_version_conflict(group.album, candidate.album)
+        and not aligned_release_positions
+        and not musicbrainz_alignment
+    ):
         reasons.append("edition/version conflict")
     if album_score < 0.72:
         reasons.append("album mismatch")
     album_names_related, _album_label_evidence = _release_album_names_related(
         group.album, candidate.album
     )
-    if not album_names_related:
+    if not album_names_related and not musicbrainz_alignment:
         reasons.append("album title mismatch")
-    if not _artists_equivalent(group.album_artist, candidate.artist):
+    if not _artists_equivalent(group.album_artist, candidate.artist) and not musicbrainz_alignment:
         reasons.append("artist mismatch")
     if matches and track_artist_score < 1.0:
         reasons.append("track artist mismatch")
@@ -708,10 +1500,15 @@ def score_candidate(
         reasons.append("tracklist mismatch")
     local_barcode = _normalize_barcode(group.barcode)
     verified_barcode = _normalize_barcode(candidate.verified_barcode)
-    identifier_verified = bool(local_barcode and local_barcode == verified_barcode)
-    if local_barcode and verified_barcode and local_barcode != verified_barcode:
+    identifier_verified = _barcodes_equivalent(local_barcode, verified_barcode)
+    if local_barcode and verified_barcode and not identifier_verified:
         reasons.append("barcode mismatch")
-    if len(matches) < 3 and not identifier_verified and not allow_short_releases:
+    if (
+        len(matches) < 3
+        and not identifier_verified
+        and not musicbrainz_alignment
+        and not allow_short_releases
+    ):
         reasons.append("fewer than three strong tracks")
     if coverage < 0.85:
         reasons.append("tracklist coverage below 85%")
@@ -728,6 +1525,7 @@ def score_candidate(
         "track_count": count_score,
         "year": year_score,
         "position": position_score,
+        "musicbrainz": float(bool(musicbrainz_alignment)),
     }
     weights = {
         "album": 0.20,
@@ -745,6 +1543,23 @@ def score_candidate(
         eligible=not reasons,
         reasons=tuple(reasons),
         components=components,
+        match_basis="legacy",
+    )
+
+
+def score_candidate(
+    group: AlbumGroup,
+    candidate: CatalogAlbum,
+    *,
+    allow_short_releases: bool = False,
+) -> CandidateScore:
+    """Score through the identifier-first path or the legacy identifier-free fallback."""
+    if matching_basis(group) != "legacy":
+        return _score_identifier_candidate(group, candidate)
+    return _score_legacy_candidate(
+        group,
+        candidate,
+        allow_short_releases=allow_short_releases,
     )
 
 
@@ -819,6 +1634,7 @@ def choose_match(
     min_margin: float = 0.10,
     allow_short_releases: bool = False,
 ) -> MatchDecision:
+    basis = matching_basis(group)
     scores = tuple(
         sorted(
             (
@@ -829,12 +1645,18 @@ def choose_match(
                 )
                 for candidate in candidates
             ),
-            key=lambda score: score.total,
-            reverse=True,
+            key=lambda score: (-score.total, score.candidate.collection_id),
         )
     )
     eligible = [score for score in scores if score.eligible]
     if not eligible:
+        if basis != "legacy":
+            return MatchDecision(
+                "no_match",
+                None,
+                scores,
+                "no candidate passed identifier-first release gates",
+            )
         return MatchDecision(
             "no_match", None, scores, "no candidate passed identity and tracklist gates"
         )
@@ -843,11 +1665,43 @@ def choose_match(
         identifier_verified = [
             score
             for score in eligible
-            if _normalize_barcode(score.candidate.verified_barcode) == local_barcode
+            if _barcodes_equivalent(score.candidate.verified_barcode, local_barcode)
         ]
         if identifier_verified:
             eligible = identifier_verified
     best = eligible[0]
+    if basis != "legacy":
+        if len(eligible) > 1 and not all(
+            _equivalent_catalog_releases(best.candidate, runner.candidate)
+            and best.candidate.artwork_url == runner.candidate.artwork_url
+            for runner in eligible[1:]
+        ):
+            return MatchDecision(
+                "ambiguous",
+                None,
+                scores,
+                "multiple non-equivalent Apple collections share identifier evidence",
+            )
+        resolution_labels = {
+            "embedded_upc": "embedded UPC",
+            "musicbrainz_apple_relation": "MusicBrainz Apple relationship",
+            "musicbrainz_barcode": "MusicBrainz barcode",
+            "musicbrainz_search": "MusicBrainz-resolved search",
+        }
+        detail = resolution_labels.get(best.candidate.identifier_resolution)
+        if detail is None:
+            direct_sources = []
+            if best.components.get("verified_upc") == 1.0:
+                direct_sources.append("UPC")
+            if best.components.get("verified_musicbrainz") == 1.0:
+                direct_sources.append("MusicBrainz")
+            detail = "+".join(direct_sources) if direct_sources else basis
+        return MatchDecision(
+            "matched",
+            best,
+            scores,
+            f"identifier-first match using {detail}",
+        )
     if best.total < min_score:
         return MatchDecision(
             "low_confidence", None, scores, f"best score {best.total:.3f} is below {min_score:.3f}"
@@ -871,6 +1725,7 @@ def choose_match(
 
 __all__ = (
     "choose_match",
+    "matching_basis",
     "normalize_text",
     "score_candidate",
     "text_similarity",

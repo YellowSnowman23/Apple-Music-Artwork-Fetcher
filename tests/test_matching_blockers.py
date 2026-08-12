@@ -216,17 +216,32 @@ def test_invalid_upc_cannot_bypass_short_release_guard() -> None:
     assert "fewer than three strong tracks" in decision.scores[0].reasons
 
 
-def test_short_release_exception_is_bound_to_exact_upc_lookup_provenance() -> None:
+@pytest.mark.parametrize("reverse", [False, True])
+def test_valid_upc_requires_direct_apple_or_resolved_musicbrainz_provenance(
+    reverse: bool,
+) -> None:
     barcode = "012345678905"
     group = local_group(count=1, barcode=barcode)
     stale_search_candidate = remote_album(count=1)
     verified = remote_album(count=1, collection_id=2, verified_barcode=barcode)
 
-    assert choose_match(group, [stale_search_candidate]).status == "no_match"
-    assert choose_match(group, [verified]).status == "matched"
+    unverified_decision = choose_match(group, [stale_search_candidate])
+    assert unverified_decision.status == "no_match"
+    assert "candidate lacks resolved identifier provenance" in (
+        unverified_decision.scores[0].reasons
+    )
+
+    candidates = [verified, stale_search_candidate]
+    if reverse:
+        candidates.reverse()
+    verified_decision = choose_match(group, candidates)
+    assert verified_decision.status == "matched"
+    assert verified_decision.match is not None
+    assert verified_decision.match.candidate.collection_id == 2
+    assert verified_decision.match.components["verified_upc"] == 1.0
 
 
-def test_release_identifiers_never_merge_different_artist_album_identity() -> None:
+def test_release_mbid_groups_tracks_despite_conflicting_legacy_identity() -> None:
     release_id = "12345678-1234-5678-9234-567812345678"
     alpha = local_group(artist="Alpha", album="Album A", count=1).logical_tracks[0]
     beta = local_group(artist="Beta", album="Album B", count=1).logical_tracks[0]
@@ -237,10 +252,11 @@ def test_release_identifiers_never_merge_different_artist_album_identity() -> No
         ]
     )
 
-    assert [(group.album_artist, group.album) for group in groups] == [
-        ("Alpha", "Album A"),
-        ("Beta", "Album B"),
-    ]
+    assert len(groups) == 1
+    assert groups[0].musicbrainz_release_id == release_id
+    assert groups[0].album_artist == "Alpha"
+    assert groups[0].album == "Album A"
+    assert groups[0].files == tuple(sorted((alpha.path, beta.path), key=str))
 
 
 def test_placeholder_identifiers_are_discarded_instead_of_becoming_group_keys() -> None:

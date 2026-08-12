@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from apple_artwork import (
     decode_artwork,
     process_library,
 )
+from apple_music_artwork.constants import VERSION
 
 
 def local_tracks(root: Path) -> tuple[TrackMetadata, ...]:
@@ -88,9 +90,15 @@ def apple_album() -> CatalogAlbum:
 
 
 class FakeClient:
-    def __init__(self, albums: list[CatalogAlbum]) -> None:
+    def __init__(
+        self,
+        albums: list[CatalogAlbum],
+        *,
+        identifier_warnings: tuple[str, ...] = (),
+    ) -> None:
         self.albums = albums
         self.calls: list[AlbumGroup] = []
+        self.last_identifier_warnings = identifier_warnings
 
     def find_candidates(self, group: AlbumGroup) -> list[CatalogAlbum]:
         self.calls.append(group)
@@ -135,10 +143,20 @@ def test_process_library_dry_run_matches_but_never_downloads_or_embeds(
     )
 
     assert report["mode"] == "dry-run"
+    assert report["schema_version"] == 3
+    assert report["program_version"] == VERSION
     assert report["summary"]["matched"] == 1
+    assert report["summary"]["matched_by_identifier"] == 0
+    assert report["summary"]["matched_by_legacy"] == 1
     assert report["summary"]["files_embedded"] == 0
     assert report["albums"][0]["status"] == "dry-run"
+    assert report["albums"][0]["match_basis"] == "legacy"
+    assert report["albums"][0]["identifier_conflicts"] == []
+    assert report["albums"][0]["identifier_warnings"] == []
     assert report["albums"][0]["apple"]["collection_id"] == 42
+    assert report["albums"][0]["apple"]["match_basis"] == "legacy"
+    assert report["albums"][0]["apple"]["warnings"] == []
+    assert report["albums"][0]["candidates"][0]["match_basis"] == "legacy"
     assert [result["status"] for result in report["albums"][0]["file_results"]] == [
         "ready",
         "ready",
@@ -183,10 +201,95 @@ def test_process_library_verbose_emits_progress_and_candidate_diagnostics(
     )
     assert any(
         line == "VERBOSE CANDIDATE Alpha — Greatest Hits collection_id=42 "
-        "eligible=true score=0.998 reasons=none"
+        "basis=legacy eligible=true score=0.998 reasons=none"
         for line in emitted
     )
     assert sum(line.startswith("VERBOSE PREFLIGHT ") for line in emitted) == 3
+
+
+def test_process_library_reports_identifier_provenance_and_resolution_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_id = "12345678-1234-5678-9234-567812345678"
+    tracks = tuple(
+        replace(track, musicbrainz_release_id=release_id) for track in local_tracks(tmp_path)
+    )
+    monkeypatch.setattr(
+        pipeline, "discover_audio_files", lambda _root: [track.path for track in tracks]
+    )
+    by_path = {track.path: track for track in tracks}
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
+    monkeypatch.setattr(
+        pipeline,
+        "preflight_artwork",
+        lambda path, *_args, **_kwargs: EmbedResult("ready", path.suffix, "safe"),
+    )
+    warning = "MusicBrainz Apple relationship returned no usable complete album"
+    client = FakeClient(
+        [
+            replace(
+                apple_album(),
+                verified_musicbrainz_release_id=release_id,
+                identifier_resolution="musicbrainz_apple_relation",
+                musicbrainz_recordings_verified=True,
+            )
+        ],
+        identifier_warnings=(warning,),
+    )
+    emitted: list[str] = []
+
+    report = process_library(
+        tmp_path,
+        verbose=True,
+        client=client,
+        downloader=NeverDownload(),
+        report_path=None,
+        emit=emitted.append,
+    )
+
+    album = report["albums"][0]
+    assert report["summary"]["matched_by_identifier"] == 1
+    assert report["summary"]["matched_by_legacy"] == 0
+    assert album["match_basis"] == "musicbrainz"
+    assert album["identifier_warnings"] == [warning]
+    assert album["apple"]["match_basis"] == "musicbrainz"
+    assert album["apple"]["verified_musicbrainz_release_id"] == release_id
+    assert album["apple"]["identifier_resolution"] == "musicbrainz_apple_relation"
+    assert album["apple"]["musicbrainz_recordings_verified"] is True
+    assert album["candidates"][0]["identifier_resolution"] == ("musicbrainz_apple_relation")
+    assert any(
+        line == f"VERBOSE IDENTIFIER-WARNING Alpha — Greatest Hits: {warning}" for line in emitted
+    )
+
+
+def test_process_library_preserves_metadata_identifier_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warning = "malformed UPC/barcode tag ignored"
+    tracks = tuple(
+        replace(track, identifier_warnings=(warning,)) for track in local_tracks(tmp_path)
+    )
+    monkeypatch.setattr(
+        pipeline, "discover_audio_files", lambda _root: [track.path for track in tracks]
+    )
+    by_path = {track.path: track for track in tracks}
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
+    monkeypatch.setattr(
+        pipeline,
+        "preflight_artwork",
+        lambda path, *_args, **_kwargs: EmbedResult("ready", path.suffix, "safe"),
+    )
+
+    report = process_library(
+        tmp_path,
+        client=FakeClient([apple_album()]),
+        downloader=NeverDownload(),
+        report_path=None,
+    )
+
+    assert report["albums"][0]["identifier_warnings"] == [warning]
 
 
 @pytest.mark.parametrize(

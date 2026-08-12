@@ -8,16 +8,34 @@ import re
 import stat
 import unicodedata
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 import mutagen
+from mutagen.aiff import AIFF
+from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4Tags
+from mutagen.id3 import ID3
+from mutagen.wave import WAVE
 
 from .constants import AUDIO_EXTENSIONS, MAX_TAG_TEXT
 from .filesystem import _open_regular_source, _stat_identity
-from .matching import _normalize_barcode, _normalize_release_id, normalize_text
+from .matching import (
+    _barcode_equivalence_key,
+    _duplicate_track_presentations_compatible,
+    _duplicate_track_title_identity,
+    _normalize_barcode,
+    _normalize_release_id,
+    normalize_text,
+)
 from .models import AlbumGroup, EmbedError, TrackMetadata
 from .mutagen_io import _load_mutagen
+
+for _easy_key, _freeform_name in (("barcode", "BARCODE"), ("upc", "UPC")):
+    if _easy_key not in EasyMP4Tags.Get:
+        EasyMP4Tags.RegisterFreeformKey(_easy_key, _freeform_name)
+if "upc" not in EasyID3.Get:
+    EasyID3.RegisterTXXXKey("upc", "UPC")
 
 
 def _clean_untrusted_text(value: object, *, maximum: int = MAX_TAG_TEXT) -> str:
@@ -39,19 +57,90 @@ def _terminal_safe(value: object) -> str:
     )
 
 
-def _first_tag(tags: Mapping[str, object] | None, *names: str) -> str:
+def _tag_values(tags: Mapping[str, object] | None, *names: str) -> tuple[str, ...]:
     if not tags:
-        return ""
+        return ()
     lowered = {str(key).casefold(): value for key, value in tags.items()}
+    values: list[str] = []
     for name in names:
         value = lowered.get(name.casefold())
-        if isinstance(value, (list, tuple)):
-            value = value[0] if value else ""
-        if value is not None:
-            cleaned = _clean_untrusted_text(value)
+        candidates = value if isinstance(value, (list, tuple)) else (value,)
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            cleaned = _clean_untrusted_text(candidate)
             if cleaned:
-                return cleaned
-    return ""
+                values.append(cleaned)
+    return tuple(dict.fromkeys(values))
+
+
+def _identifier_tag_values(
+    tags: Mapping[str, object] | None,
+    *names: str,
+) -> tuple[tuple[str, ...], bool, bool]:
+    """Return safely cleaned identifier values plus whether any raw tag was present."""
+    if not tags:
+        return (), False, False
+    lowered = {str(key).casefold(): value for key, value in tags.items()}
+    values: list[str] = []
+    present = False
+    rejected = False
+    for name in names:
+        key = name.casefold()
+        if key not in lowered:
+            continue
+        value = lowered[key]
+        candidates = value if isinstance(value, (list, tuple)) else (value,)
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            present = True
+            cleaned = _clean_untrusted_text(candidate)
+            if cleaned:
+                values.append(cleaned)
+            else:
+                rejected = True
+    return tuple(dict.fromkeys(values)), present, rejected
+
+
+def _first_tag(tags: Mapping[str, object] | None, *names: str) -> str:
+    values = _tag_values(tags, *names)
+    return values[0] if values else ""
+
+
+def _identifier_tag(
+    tags: Mapping[str, object] | None,
+    *names: str,
+    normalizer: Callable[[str | None], str | None],
+    malformed_warning: str,
+    conflict_warning: str,
+    equivalence_key: Callable[[str | None], object] | None = None,
+) -> tuple[str | None, tuple[str, ...]]:
+    raw_values, tag_present, rejected_value = _identifier_tag_values(tags, *names)
+    normalized_values = tuple(
+        value for raw_value in raw_values if (value := normalizer(raw_value)) is not None
+    )
+    warnings: list[str] = []
+    if tag_present and (
+        rejected_value or not raw_values or len(normalized_values) != len(raw_values)
+    ):
+        warnings.append(malformed_warning)
+    key = equivalence_key or (lambda value: value)
+    keys = {key(value) for value in normalized_values}
+    if len(keys) > 1:
+        warnings.append(conflict_warning)
+        return None, tuple(warnings)
+    return (normalized_values[0] if normalized_values else None), tuple(warnings)
+
+
+def _easy_id3_tags(tags: ID3) -> Mapping[str, object]:
+    values: dict[str, object] = {}
+    for key, getter in EasyID3.Get.items():
+        try:
+            values[key] = getter(tags, key)
+        except (KeyError, UnicodeError, ValueError):
+            continue
+    return values
 
 
 def _number_pair(value: str) -> tuple[int | None, int | None]:
@@ -155,6 +244,8 @@ def read_track_metadata(
         return None
 
     tags = audio.tags
+    if isinstance(audio, (WAVE, AIFF)) and isinstance(tags, ID3):
+        tags = _easy_id3_tags(tags)
     title = _first_tag(tags, "title")
     album = _first_tag(tags, "album")
     artist = _first_tag(tags, "artist")
@@ -162,8 +253,32 @@ def read_track_metadata(
     track_number, track_total = _number_pair(_first_tag(tags, "tracknumber"))
     disc_number, disc_total = _number_pair(_first_tag(tags, "discnumber"))
     date = _first_tag(tags, "date", "year", "originaldate")
-    barcode = _first_tag(tags, "barcode", "upc") or None
-    release_id = _first_tag(tags, "musicbrainz_albumid", "musicbrainz release id") or None
+    barcode, barcode_warnings = _identifier_tag(
+        tags,
+        "barcode",
+        "upc",
+        normalizer=_normalize_barcode,
+        malformed_warning="malformed UPC/barcode tag ignored",
+        conflict_warning="conflicting UPC/barcode values within one file",
+        equivalence_key=_barcode_equivalence_key,
+    )
+    release_id, release_warnings = _identifier_tag(
+        tags,
+        "musicbrainz_albumid",
+        "musicbrainz release id",
+        normalizer=_normalize_release_id,
+        malformed_warning="malformed MusicBrainz release MBID tag ignored",
+        conflict_warning="conflicting MusicBrainz release MBIDs within one file",
+    )
+    recording_id, recording_warnings = _identifier_tag(
+        tags,
+        "musicbrainz_trackid",
+        "musicbrainz recording id",
+        normalizer=_normalize_release_id,
+        malformed_warning="malformed MusicBrainz recording MBID tag ignored",
+        conflict_warning="conflicting MusicBrainz recording MBIDs within one file",
+    )
+    identifier_warnings = (*barcode_warnings, *release_warnings, *recording_warnings)
     duration = getattr(getattr(audio, "info", None), "length", None)
     duration_ms: int | None = None
     try:
@@ -189,48 +304,170 @@ def read_track_metadata(
         disc_number=disc_number,
         disc_total=disc_total,
         duration_ms=duration_ms,
-        barcode=_normalize_barcode(barcode),
-        musicbrainz_release_id=_normalize_release_id(release_id),
+        barcode=barcode,
+        musicbrainz_release_id=release_id,
         source_identity=source_identity,
+        musicbrainz_recording_id=recording_id,
+        identifier_warnings=identifier_warnings,
     )
 
 
-def _release_key(track: TrackMetadata) -> tuple[object, ...]:
-    identity = (
+def _tag_release_identity(track: TrackMetadata) -> tuple[object, ...]:
+    return (
         normalize_text(track.album_artist or track.artist),
         normalize_text(track.album),
         track.year,
     )
-    release_id = _normalize_release_id(track.musicbrainz_release_id)
-    barcode = _normalize_barcode(track.barcode)
-    if release_id:
-        return ("musicbrainz", release_id, *identity)
-    if barcode:
-        return ("barcode", barcode, *identity)
-    return ("tags", *identity)
 
 
 def _logical_track_key(track: TrackMetadata) -> tuple[object, ...]:
     disc = track.disc_number or 1
+    recording_id = _normalize_release_id(track.musicbrainz_recording_id)
+    if recording_id:
+        return ("musicbrainz-recording", recording_id, disc, track.track_number)
     if track.track_number:
         return (disc, track.track_number, normalize_text(track.title))
     duration_bucket = round((track.duration_ms or 0) / 2_000)
     return (disc, normalize_text(track.title), duration_bucket)
 
 
+def _logical_position_key(track: TrackMetadata) -> tuple[object, ...] | None:
+    if track.track_number is None:
+        return None
+    return (
+        track.disc_number or 1,
+        track.track_number,
+        _duplicate_track_title_identity(track.title),
+    )
+
+
 def group_tracks(tracks: Iterable[TrackMetadata]) -> list[AlbumGroup]:
     """Group by release tags and collapse duplicate encodings of each logical track."""
-    buckets: dict[tuple[object, ...], list[TrackMetadata]] = defaultdict(list)
-    for track in tracks:
-        if track.album and track.title and (track.album_artist or track.artist):
-            buckets[_release_key(track)].append(track)
+    members = sorted(
+        (
+            track
+            for track in tracks
+            if track.album and track.title and (track.album_artist or track.artist)
+        ),
+        key=lambda track: str(track.path),
+    )
+    parents = list(range(len(members)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    identifier_owners: dict[tuple[str, object], int] = {}
+    for index, track in enumerate(members):
+        release_id = _normalize_release_id(track.musicbrainz_release_id)
+        barcode = _normalize_barcode(track.barcode)
+        keys: list[tuple[str, object]] = []
+        if release_id is not None:
+            keys.append(("musicbrainz", release_id))
+        if barcode is not None:
+            keys.append(("barcode", _barcode_equivalence_key(barcode)))
+        keys.append(("tags", _tag_release_identity(track)))
+        for key in keys:
+            owner = identifier_owners.setdefault(key, index)
+            union(index, owner)
+
+    buckets: dict[int, list[TrackMetadata]] = defaultdict(list)
+    for index, track in enumerate(members):
+        buckets[find(index)].append(track)
 
     groups: list[AlbumGroup] = []
     for members in buckets.values():
         logical: dict[tuple[object, ...], TrackMetadata] = {}
         for track in sorted(members, key=lambda item: str(item.path)):
-            logical.setdefault(_logical_track_key(track), track)
+            key = _logical_track_key(track)
+            position_key = _logical_position_key(track)
+            compatible_key = next(
+                (
+                    existing_key
+                    for existing_key, existing in logical.items()
+                    if position_key is not None
+                    and _logical_position_key(existing) == position_key
+                    and _duplicate_track_presentations_compatible(existing, track)
+                    and (
+                        _normalize_release_id(existing.musicbrainz_recording_id) is None
+                        or _normalize_release_id(track.musicbrainz_recording_id) is None
+                        or _normalize_release_id(existing.musicbrainz_recording_id)
+                        == _normalize_release_id(track.musicbrainz_recording_id)
+                    )
+                ),
+                None,
+            )
+            if compatible_key is None:
+                if key in logical and not _duplicate_track_presentations_compatible(
+                    logical[key], track
+                ):
+                    key = (*key, "presentation", str(track.path))
+                logical.setdefault(key, track)
+                continue
+            existing = logical[compatible_key]
+            if (
+                _normalize_release_id(existing.musicbrainz_recording_id) is None
+                and _normalize_release_id(track.musicbrainz_recording_id) is not None
+            ):
+                logical[compatible_key] = track
         first = members[0]
+        release_ids = {
+            release_id
+            for track in members
+            if (release_id := _normalize_release_id(track.musicbrainz_release_id)) is not None
+        }
+        normalized_barcodes_by_key = {
+            _barcode_equivalence_key(barcode): barcode
+            for track in members
+            if (barcode := _normalize_barcode(track.barcode)) is not None
+        }
+        conflicts: list[str] = []
+        if len(release_ids) > 1:
+            conflicts.append("conflicting MusicBrainz release MBIDs within the album group")
+        if len(normalized_barcodes_by_key) > 1:
+            conflicts.append("conflicting UPC/barcode tags within the album group")
+        release_id = next(iter(release_ids)) if len(release_ids) == 1 else None
+        barcode = (
+            next(iter(normalized_barcodes_by_key.values()))
+            if len(normalized_barcodes_by_key) == 1
+            else None
+        )
+        musicbrainz_provenance_complete = bool(
+            release_id
+            and all(
+                _normalize_release_id(track.musicbrainz_release_id) == release_id
+                and _normalize_release_id(track.musicbrainz_recording_id) is not None
+                for track in members
+            )
+        )
+        recording_ids_by_position: dict[tuple[object, ...], set[str]] = defaultdict(set)
+        for track in members:
+            recording_id = _normalize_release_id(track.musicbrainz_recording_id)
+            position_key = _logical_position_key(track)
+            if recording_id is not None and position_key is not None:
+                recording_ids_by_position[position_key].add(recording_id)
+        if any(len(recording_ids) > 1 for recording_ids in recording_ids_by_position.values()):
+            conflicts.append("conflicting MusicBrainz recording MBIDs at one album track position")
+        identifier_warnings = tuple(
+            dict.fromkeys(warning for track in members for warning in track.identifier_warnings)
+        )
+        per_file_conflicts = tuple(
+            warning
+            for warning in identifier_warnings
+            if warning.startswith("conflicting ") and warning.endswith(" within one file")
+        )
+        conflicts.extend(per_file_conflicts)
+        identifier_warnings = tuple(
+            warning for warning in identifier_warnings if warning not in per_file_conflicts
+        )
         groups.append(
             AlbumGroup(
                 album=first.album,
@@ -238,13 +475,16 @@ def group_tracks(tracks: Iterable[TrackMetadata]) -> list[AlbumGroup]:
                 year=first.year,
                 files=tuple(sorted((track.path for track in members), key=str)),
                 logical_tracks=tuple(logical.values()),
-                barcode=_normalize_barcode(first.barcode),
-                musicbrainz_release_id=_normalize_release_id(first.musicbrainz_release_id),
+                barcode=barcode,
+                musicbrainz_release_id=release_id,
                 source_identities=tuple(
                     (track.path, track.source_identity)
                     for track in sorted(members, key=lambda item: str(item.path))
                     if track.source_identity is not None
                 ),
+                musicbrainz_provenance_complete=musicbrainz_provenance_complete,
+                identifier_conflicts=tuple(conflicts),
+                identifier_warnings=identifier_warnings,
             )
         )
     return sorted(

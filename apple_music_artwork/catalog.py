@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -17,15 +17,23 @@ from .constants import ITUNES_LOOKUP_URL, ITUNES_SEARCH_URL, MAX_API_BYTES, USER
 from .filesystem import _atomic_write_bytes, _read_secure_file
 from .matching import (
     _artists_equivalent,
+    _barcodes_equivalent,
+    _explicit_remaster_years_conflict,
+    _musicbrainz_album_identity,
+    _musicbrainz_search_artist_and_features_match,
+    _musicbrainz_search_identity_matches,
     _normalize_barcode,
+    _normalize_release_id,
     _split_trailing_remaster,
     _without_trailing_album_version,
+    matching_basis,
     normalize_text,
     score_candidate,
     text_similarity,
 )
 from .metadata import _year
-from .models import AlbumGroup, CatalogAlbum, CatalogTrack
+from .models import AlbumGroup, CatalogAlbum, CatalogTrack, MusicBrainzRelease
+from .musicbrainz import MusicBrainzClient, _ResolvedMusicBrainzRelease
 from .network import (
     _close_response,
     _read_bounded_body,
@@ -48,6 +56,8 @@ def candidate_ids_from_album_search(
     album: str,
     *,
     track_count: int | None = None,
+    release_year: int | None = None,
+    identifier_first: bool = False,
     limit: int = 12,
 ) -> list[int]:
     ranked: list[tuple[float, int]] = []
@@ -60,12 +70,33 @@ def candidate_ids_from_album_search(
         album_score = text_similarity(album, row_album)
         artist_score = text_similarity(artist, row_artist)
         exact_count = track_count is not None and _as_int(row.get("trackCount")) == track_count
-        if not _artists_equivalent(artist, row_artist) or (album_score < 0.62 and not exact_count):
+        row_year = _year(str(row.get("releaseDate") or ""))
+        if identifier_first:
+            if (
+                not _musicbrainz_search_artist_and_features_match(
+                    album,
+                    artist,
+                    row_album,
+                    row_artist,
+                )
+                or _musicbrainz_album_identity(album) != _musicbrainz_album_identity(row_album)
+                or _explicit_remaster_years_conflict(album, row_album)
+                or (track_count is not None and not exact_count)
+                or (
+                    release_year is not None
+                    and row_year is not None
+                    and abs(release_year - row_year) > 1
+                )
+            ):
+                continue
+        elif not _artists_equivalent(artist, row_artist) or (
+            album_score < 0.62 and not exact_count
+        ):
             continue
         ranked.append(
             (0.57 * album_score + 0.38 * artist_score + 0.05 * float(exact_count), collection_id)
         )
-    ranked.sort(key=lambda item: item[0], reverse=True)
+    ranked.sort(key=lambda item: (-item[0], item[1]))
     return list(dict.fromkeys(collection_id for _, collection_id in ranked[:limit]))
 
 
@@ -105,7 +136,7 @@ def candidate_ids_from_song_search(
         ranked.append(
             (0.46 * title_score + 0.34 * artist_score + 0.20 * album_score, collection_id)
         )
-    ranked.sort(key=lambda item: item[0], reverse=True)
+    ranked.sort(key=lambda item: (-item[0], item[1]))
     return list(dict.fromkeys(collection_id for _, collection_id in ranked[:8]))
 
 
@@ -201,12 +232,14 @@ class AppleCatalogClient:
         max_retries: int = 4,
         cache_ttl_days: int = 30,
         max_response_bytes: int = MAX_API_BYTES,
+        musicbrainz_client: object | None = None,
     ) -> None:
         country = country.upper()
         if not re.fullmatch(r"[A-Z]{2}", country):
             raise ValueError("country must be a two-letter storefront code")
         self.country = country
         self.cache_dir = cache_dir / "api"
+        self.musicbrainz_client = musicbrainz_client or MusicBrainzClient(cache_dir=cache_dir)
         self.session = session or requests.Session()
         headers = getattr(self.session, "headers", None)
         if headers is not None:
@@ -222,6 +255,7 @@ class AppleCatalogClient:
         self.cache_ttl_seconds = max(0, cache_ttl_days) * 86_400
         self.max_response_bytes = max(1, min(int(max_response_bytes), MAX_API_BYTES))
         self._last_request = 0.0
+        self.last_identifier_warnings: tuple[str, ...] = ()
 
     @staticmethod
     def _cache_key(url: str, params: Mapping[str, object]) -> str:
@@ -366,7 +400,12 @@ class AppleCatalogClient:
                     "limit": 200,
                 },
             )
-            parsed = catalog_albums_from_lookup(lookup_rows)
+            chunk_ids = set(chunk)
+            parsed = [
+                album
+                for album in catalog_albums_from_lookup(lookup_rows)
+                if album.collection_id in chunk_ids
+            ]
             albums.extend(parsed)
             returned = {album.collection_id for album in parsed}
             for missing_id in (
@@ -381,7 +420,11 @@ class AppleCatalogClient:
                         "limit": 200,
                     },
                 )
-                albums.extend(catalog_albums_from_lookup(individual_rows))
+                albums.extend(
+                    album
+                    for album in catalog_albums_from_lookup(individual_rows)
+                    if album.collection_id == missing_id
+                )
         return list({album.collection_id: album for album in albums}.values())
 
     def _song_fallback_ids(self, group: AlbumGroup) -> list[int]:
@@ -416,28 +459,302 @@ class AppleCatalogClient:
         return list(dict.fromkeys(fallback_ids))[:8]
 
     def find_candidates(self, group: AlbumGroup) -> list[CatalogAlbum]:
-        barcode = _normalize_barcode(group.barcode)
-        if barcode:
+        warnings: list[str] = list(group.identifier_warnings)
+        self.last_identifier_warnings = ()
+
+        def finish(albums: list[CatalogAlbum]) -> list[CatalogAlbum]:
+            self.last_identifier_warnings = tuple(warnings)
+            return albums
+
+        if group.identifier_conflicts:
+            warnings.extend(group.identifier_conflicts)
+            return finish([])
+
+        local_barcode = _normalize_barcode(group.barcode)
+        release_id = _normalize_release_id(group.musicbrainz_release_id)
+        upc_albums: list[CatalogAlbum] = []
+        if local_barcode:
             upc_rows = self._request_results(
                 ITUNES_LOOKUP_URL,
                 {
-                    "upc": barcode,
+                    "upc": local_barcode,
                     "country": self.country,
                     "entity": "song",
                     "limit": 200,
                 },
             )
             upc_albums = [
-                replace(album, verified_barcode=barcode)
+                replace(
+                    album,
+                    verified_barcode=local_barcode,
+                    identifier_resolution="embedded_upc",
+                )
                 for album in catalog_albums_from_lookup(upc_rows)
             ]
-            if upc_albums:
-                return upc_albums
+            if upc_albums and release_id is None:
+                return finish(upc_albums)
+            if not upc_albums:
+                warnings.append("the embedded UPC returned no usable complete Apple album")
+            if not upc_albums and release_id is None:
+                return finish([])
 
+        resolution = None
+        if release_id is not None:
+            try:
+                resolved = self.musicbrainz_client.resolve(release_id)  # type: ignore[attr-defined]
+            except Exception:
+                if upc_albums:
+                    warnings.append(
+                        "the MusicBrainz release lookup failed; the exact UPC match was "
+                        "retained but the release MBID could not be cross-validated"
+                    )
+                    return finish(upc_albums)
+                warnings.append(
+                    "the MusicBrainz release lookup failed; no unverified Apple candidate "
+                    "was trusted"
+                )
+                return finish([])
+            if resolved is None:
+                if upc_albums:
+                    warnings.append(
+                        "MusicBrainz did not resolve the embedded release MBID; the exact "
+                        "UPC match was retained but the MBID could not be cross-validated"
+                    )
+                    return finish(upc_albums)
+                warnings.append(
+                    "MusicBrainz did not resolve the embedded release MBID; no unverified "
+                    "Apple candidate was trusted"
+                )
+                return finish([])
+            if isinstance(resolved, _ResolvedMusicBrainzRelease):
+                if type(self.musicbrainz_client) is not MusicBrainzClient:
+                    warnings.append(
+                        "a custom MusicBrainz resolver cannot assert merged-release "
+                        "alias provenance"
+                    )
+                    return finish([])
+                if _normalize_release_id(resolved.requested_release_id) != release_id:
+                    warnings.append(
+                        "MusicBrainz returned resolution evidence for a different release MBID"
+                    )
+                    return finish([])
+                resolution = resolved.release
+                alias_provenance = True
+            elif isinstance(resolved, MusicBrainzRelease):
+                resolution = resolved
+                alias_provenance = False
+            else:
+                warnings.append("MusicBrainz returned malformed release resolution evidence")
+                return finish([])
+            resolved_release_id = _normalize_release_id(resolution.release_id)
+            if resolved_release_id is None:
+                warnings.append(
+                    "MusicBrainz returned an invalid release MBID for the embedded identifier"
+                )
+                return finish([])
+            if resolved_release_id != release_id:
+                if not alias_provenance:
+                    warnings.append(
+                        "MusicBrainz returned a different release MBID than the embedded identifier"
+                    )
+                    return finish([])
+                warnings.append(
+                    "MusicBrainz resolved the embedded release MBID to canonical release MBID "
+                    f"{resolved_release_id}"
+                )
+            if (
+                not isinstance(resolution.title, str)
+                or not resolution.title.strip()
+                or not isinstance(resolution.artist, str)
+                or not resolution.artist.strip()
+                or not isinstance(resolution.recording_ids, tuple)
+                or not isinstance(resolution.apple_collection_ids, tuple)
+                or (resolution.barcode is not None and not isinstance(resolution.barcode, str))
+                or (
+                    resolution.release_year is not None
+                    and (
+                        not isinstance(resolution.release_year, int)
+                        or isinstance(resolution.release_year, bool)
+                        or not 1800 <= resolution.release_year <= 2199
+                    )
+                )
+                or (
+                    resolution.track_count is not None
+                    and (
+                        not isinstance(resolution.track_count, int)
+                        or isinstance(resolution.track_count, bool)
+                        or not 0 < resolution.track_count <= 10_000
+                    )
+                )
+            ):
+                warnings.append("MusicBrainz returned malformed release resolution evidence")
+                return finish([])
+            normalized_barcode = _normalize_barcode(resolution.barcode)
+            normalized_recording_ids = tuple(
+                _normalize_release_id(raw_recording_id)
+                for raw_recording_id in resolution.recording_ids
+            )
+            collection_ids_are_valid = all(
+                isinstance(raw_collection_id, int)
+                and not isinstance(raw_collection_id, bool)
+                and raw_collection_id > 0
+                for raw_collection_id in resolution.apple_collection_ids
+            )
+            if (
+                (resolution.barcode is not None and normalized_barcode is None)
+                or any(recording_id is None for recording_id in normalized_recording_ids)
+                or not collection_ids_are_valid
+            ):
+                warnings.append("MusicBrainz returned malformed release resolution evidence")
+                return finish([])
+            normalized_collection_ids = tuple(sorted(set(resolution.apple_collection_ids)))
+            resolution = MusicBrainzRelease(
+                release_id=resolved_release_id,
+                title=str(resolution.title).strip(),
+                artist=str(resolution.artist).strip(),
+                release_year=(
+                    resolution.release_year
+                    if isinstance(resolution.release_year, int)
+                    and not isinstance(resolution.release_year, bool)
+                    and 1800 <= resolution.release_year <= 2199
+                    else None
+                ),
+                track_count=(
+                    resolution.track_count
+                    if isinstance(resolution.track_count, int)
+                    and not isinstance(resolution.track_count, bool)
+                    and 0 < resolution.track_count <= 10_000
+                    else None
+                ),
+                barcode=normalized_barcode,
+                apple_collection_ids=normalized_collection_ids,
+                recording_ids=tuple(
+                    recording_id
+                    for recording_id in normalized_recording_ids
+                    if recording_id is not None
+                ),
+            )
+        if (
+            resolution is not None
+            and local_barcode is not None
+            and resolution.barcode is not None
+            and not _barcodes_equivalent(local_barcode, resolution.barcode)
+        ):
+            warnings.append(
+                "the embedded UPC conflicts with the resolved MusicBrainz release barcode"
+            )
+            return finish([])
+
+        recordings_verified = False
+        if resolution is not None and resolution.recording_ids:
+            local_recording_ids = tuple(
+                recording_id
+                for track in group.logical_tracks
+                if (recording_id := _normalize_release_id(track.musicbrainz_recording_id))
+                is not None
+            )
+            if local_recording_ids:
+                local_recordings = Counter(local_recording_ids)
+                resolved_recordings = Counter(resolution.recording_ids)
+                if any(
+                    count > resolved_recordings[recording_id]
+                    for recording_id, count in local_recordings.items()
+                ):
+                    warnings.append(
+                        "the embedded recording MBIDs could not be verified against the "
+                        "resolved MusicBrainz release (including possible merged aliases)"
+                    )
+                    return finish([])
+                recordings_verified = group.musicbrainz_provenance_complete
+        if upc_albums and resolution is not None:
+            upc_ids = {album.collection_id for album in upc_albums}
+            related_ids = set(resolution.apple_collection_ids)
+            barcode_cross_validated = bool(
+                resolution.barcode
+                and local_barcode
+                and _barcodes_equivalent(resolution.barcode, local_barcode)
+            )
+            relations_disjoint = bool(related_ids and upc_ids.isdisjoint(related_ids))
+            if relations_disjoint and not barcode_cross_validated:
+                warnings.append(
+                    "the embedded UPC and MusicBrainz release point to different Apple collections"
+                )
+                return finish([])
+            if relations_disjoint:
+                warnings.append(
+                    "the MusicBrainz Apple relationship points to a different storefront "
+                    "collection; the barcode-consistent exact UPC result was retained"
+                )
+            elif related_ids:
+                upc_albums = [album for album in upc_albums if album.collection_id in related_ids]
+            if resolution.barcode is None and not related_ids:
+                warnings.append(
+                    "the MusicBrainz release supplied no direct Apple or barcode crosswalk; "
+                    "the exact UPC match was retained"
+                )
+            cross_validated = bool(related_ids or barcode_cross_validated)
+            return finish(
+                [
+                    replace(
+                        album,
+                        verified_musicbrainz_release_id=(release_id if cross_validated else None),
+                        musicbrainz_recordings_verified=(
+                            recordings_verified if cross_validated else False
+                        ),
+                    )
+                    for album in upc_albums
+                ]
+            )
+        if resolution is not None and resolution.apple_collection_ids:
+            related = self._lookup_collection_ids(resolution.apple_collection_ids)
+            if related:
+                return finish(
+                    [
+                        replace(
+                            album,
+                            verified_musicbrainz_release_id=release_id,
+                            identifier_resolution="musicbrainz_apple_relation",
+                            musicbrainz_recordings_verified=recordings_verified,
+                        )
+                        for album in related
+                    ]
+                )
+            warnings.append("MusicBrainz Apple relationship returned no usable complete album")
+        if resolution is not None and resolution.barcode:
+            resolved_upc_rows = self._request_results(
+                ITUNES_LOOKUP_URL,
+                {
+                    "upc": resolution.barcode,
+                    "country": self.country,
+                    "entity": "song",
+                    "limit": 200,
+                },
+            )
+            resolved_upc_albums = [
+                replace(
+                    album,
+                    verified_barcode=resolution.barcode,
+                    verified_musicbrainz_release_id=release_id,
+                    identifier_resolution="musicbrainz_barcode",
+                    musicbrainz_recordings_verified=recordings_verified,
+                )
+                for album in catalog_albums_from_lookup(resolved_upc_rows)
+            ]
+            if resolved_upc_albums:
+                return finish(resolved_upc_albums)
+            warnings.append("the MusicBrainz barcode returned no usable complete Apple album")
+
+        search_artist = resolution.artist if resolution is not None else group.album_artist
+        search_album = resolution.title if resolution is not None else group.album
+        search_count = (
+            resolution.track_count
+            if resolution is not None and resolution.track_count is not None
+            else len(group.logical_tracks)
+        )
         search_rows = self._request_results(
             ITUNES_SEARCH_URL,
             {
-                "term": f"{group.album_artist} {group.album}",
+                "term": f"{search_artist} {search_album}",
                 "country": self.country,
                 "media": "music",
                 "entity": "album",
@@ -446,22 +763,58 @@ class AppleCatalogClient:
         )
         collection_ids = candidate_ids_from_album_search(
             search_rows,
-            group.album_artist,
-            group.album,
-            track_count=len(group.logical_tracks),
+            search_artist,
+            search_album,
+            track_count=search_count,
+            release_year=resolution.release_year if resolution is not None else group.year,
+            identifier_first=matching_basis(group) != "legacy",
         )
         albums = self._lookup_collection_ids(collection_ids) if collection_ids else []
+        if resolution is not None:
+            albums = [
+                replace(
+                    album,
+                    verified_musicbrainz_release_id=release_id,
+                    identifier_resolution="musicbrainz_search",
+                    musicbrainz_recordings_verified=recordings_verified,
+                    resolved_musicbrainz_title=resolution.title,
+                    resolved_musicbrainz_artist=resolution.artist,
+                    resolved_musicbrainz_track_count=resolution.track_count,
+                    resolved_musicbrainz_release_year=resolution.release_year,
+                    musicbrainz_search_track_count=search_count,
+                    musicbrainz_search_track_count_source=(
+                        "musicbrainz" if resolution.track_count is not None else "local"
+                    ),
+                )
+                for album in albums
+                if _musicbrainz_search_identity_matches(
+                    resolution.title,
+                    resolution.artist,
+                    search_count,
+                    album.album,
+                    album.artist,
+                    album.track_count,
+                    resolution.release_year,
+                    album.release_year,
+                )
+            ]
         has_verified_tracklist = any(
             score_candidate(group, album, allow_short_releases=True).eligible for album in albums
         )
-        if not has_verified_tracklist:
+        if not has_verified_tracklist and resolution is None:
             fallback_ids = [
                 collection_id
                 for collection_id in self._song_fallback_ids(group)
                 if collection_id not in collection_ids
             ]
-            albums.extend(self._lookup_collection_ids(fallback_ids))
-        return list({album.collection_id: album for album in albums}.values())
+            fallback_albums = self._lookup_collection_ids(fallback_ids)
+            albums.extend(fallback_albums)
+        candidates = list({album.collection_id: album for album in albums}.values())
+        if matching_basis(group) != "legacy" and not candidates:
+            warnings.append(
+                "the identifier-authoritative Apple search returned no usable complete album"
+            )
+        return finish(candidates)
 
 
 __all__ = (
