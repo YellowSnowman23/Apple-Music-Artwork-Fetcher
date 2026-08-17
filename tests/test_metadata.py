@@ -138,6 +138,26 @@ def test_read_track_metadata_uses_tags_and_only_reads_audio_headers(tmp_path: Pa
     assert 200 <= (track.duration_ms or 0) <= 300
 
 
+def test_read_track_metadata_reads_standalone_track_and_disc_totals(tmp_path: Path) -> None:
+    path = tmp_path / "Artist" / "Album" / "song.flac"
+    make_flac(path)
+    audio = FLAC(path)
+    audio["title"] = "Song"
+    audio["artist"] = "Artist"
+    audio["album"] = "Album"
+    audio["tracknumber"] = "12"
+    audio["tracktotal"] = "14"
+    audio["discnumber"] = "2"
+    audio["disctotal"] = "3"
+    audio.save()
+
+    track = read_track_metadata(path)
+
+    assert track is not None
+    assert (track.track_number, track.track_total) == (12, 14)
+    assert (track.disc_number, track.disc_total) == (2, 3)
+
+
 def test_group_tracks_requires_musicbrainz_ids_on_every_physical_file() -> None:
     release_id = "12345678-1234-1234-1234-123456789abc"
     recording_id = "abcdefab-cdef-4abc-8def-abcdefabcdef"

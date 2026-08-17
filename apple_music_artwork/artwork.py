@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import struct
 import time
 import warnings
+from collections.abc import Callable
+from dataclasses import dataclass
 from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .constants import (
     MAX_ARTWORK_BYTES,
@@ -30,6 +34,29 @@ from .network import (
     _retry_delay,
     _validate_remote_url,
 )
+
+JPEG_QUALITY_LADDER = (95, 92, 90, 88, 85, 82, 80)
+JPEG_ALPHA_MATTE = "#FFFFFF"
+_MAX_DOWNSCALE_ATTEMPTS = 12
+
+
+@dataclass(frozen=True, slots=True)
+class ArtworkDerivation:
+    """One source artwork and the exact variant selected for a container."""
+
+    artwork: Artwork
+    source_sha256: str
+    source_mime: str
+    source_width: int
+    source_height: int
+    source_bytes: int
+    transformation: str
+    jpeg_quality: int | None = None
+    alpha_matte: str | None = None
+
+    @property
+    def dimensions_retained(self) -> bool:
+        return self.transformation != "jpeg_reencoded_downscaled"
 
 
 def build_artwork_urls(artwork_url: str, *, max_dimension: int | None = None) -> list[str]:
@@ -134,6 +161,159 @@ def decode_artwork(data: bytes, source_url: str) -> Artwork:
         depth=_source_image_depth(data, image_format),
         source_url=source_url,
         sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+
+def _source_derivation(artwork: Artwork) -> ArtworkDerivation:
+    return ArtworkDerivation(
+        artwork=artwork,
+        source_sha256=artwork.sha256,
+        source_mime=artwork.mime,
+        source_width=artwork.width,
+        source_height=artwork.height,
+        source_bytes=len(artwork.data),
+        transformation="source",
+    )
+
+
+def _jpeg_source_image(artwork: Artwork) -> tuple[Image.Image, str | None, bytes | None]:
+    """Decode a validated source and make JPEG alpha handling deterministic."""
+    validated = decode_artwork(artwork.data, artwork.source_url)
+    expected = (
+        artwork.mime,
+        artwork.width,
+        artwork.height,
+        artwork.depth,
+        artwork.sha256,
+    )
+    observed = (
+        validated.mime,
+        validated.width,
+        validated.height,
+        validated.depth,
+        validated.sha256,
+    )
+    if observed != expected:
+        raise ArtworkError("artwork bytes do not match their validated metadata")
+
+    try:
+        with Image.open(BytesIO(artwork.data)) as opened:
+            opened.load()
+            icc_profile = opened.info.get("icc_profile")
+            if not isinstance(icc_profile, bytes):
+                icc_profile = None
+            oriented = ImageOps.exif_transpose(opened)
+            has_alpha = oriented.mode in {"LA", "RGBA"} or "transparency" in oriented.info
+            if has_alpha:
+                rgba = oriented.convert("RGBA")
+                alpha = rgba.getchannel("A")
+                if alpha.getextrema() != (255, 255):
+                    flattened = Image.new("RGB", rgba.size, (255, 255, 255))
+                    flattened.paste(rgba, mask=alpha)
+                    return flattened, JPEG_ALPHA_MATTE, icc_profile
+            return oriented.convert("RGB"), None, icc_profile
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise ArtworkError("artwork could not be prepared for JPEG embedding") from exc
+
+
+def _encode_jpeg_variant(
+    image: Image.Image,
+    source: Artwork,
+    *,
+    quality: int,
+    icc_profile: bytes | None,
+) -> Artwork:
+    output = BytesIO()
+    options: dict[str, object] = {
+        "format": "JPEG",
+        "quality": quality,
+        "optimize": True,
+        "progressive": True,
+        "subsampling": 2,
+    }
+    if icc_profile is not None:
+        options["icc_profile"] = icc_profile
+    try:
+        image.save(output, **options)
+    except (OSError, ValueError) as exc:
+        raise ArtworkError("artwork could not be re-encoded as JPEG") from exc
+    return decode_artwork(output.getvalue(), source.source_url)
+
+
+def derive_embeddable_artwork(
+    artwork: Artwork,
+    *,
+    fits: Callable[[Artwork], bool],
+    target_data_bytes: int,
+    jpeg_qualities: tuple[int, ...] = JPEG_QUALITY_LADDER,
+) -> ArtworkDerivation:
+    """Return source bytes when possible, otherwise a bounded JPEG derivative.
+
+    JPEG conversion keeps the source pixel dimensions first. Transparent pixels
+    are composited on an opaque white matte because JPEG has no alpha channel.
+    Only after every configured quality fails is the image reduced with Lanczos.
+    """
+    if fits(artwork):
+        return _source_derivation(artwork)
+    if target_data_bytes < 1:
+        raise ArtworkError("embedded artwork byte limit is invalid")
+    if not jpeg_qualities or any(not 1 <= quality <= 95 for quality in jpeg_qualities):
+        raise ArtworkError("JPEG quality ladder must contain values from 1 through 95")
+    if any(left <= right for left, right in pairwise(jpeg_qualities)):
+        raise ArtworkError("JPEG quality ladder must be strictly descending")
+
+    image, alpha_matte, icc_profile = _jpeg_source_image(artwork)
+    downscaled = False
+    for _attempt in range(_MAX_DOWNSCALE_ATTEMPTS + 1):
+        smallest: Artwork | None = None
+        for quality in jpeg_qualities:
+            candidate = _encode_jpeg_variant(
+                image,
+                artwork,
+                quality=quality,
+                icc_profile=icc_profile,
+            )
+            if fits(candidate):
+                return ArtworkDerivation(
+                    artwork=candidate,
+                    source_sha256=artwork.sha256,
+                    source_mime=artwork.mime,
+                    source_width=artwork.width,
+                    source_height=artwork.height,
+                    source_bytes=len(artwork.data),
+                    transformation=(
+                        "jpeg_reencoded_downscaled" if downscaled else "jpeg_reencoded"
+                    ),
+                    jpeg_quality=quality,
+                    alpha_matte=alpha_matte,
+                )
+            smallest = candidate
+
+        assert smallest is not None
+        current_width, current_height = image.size
+        minimum_scale = max(
+            MIN_ARTWORK_DIMENSION / current_width,
+            MIN_ARTWORK_DIMENSION / current_height,
+        )
+        if minimum_scale >= 1:
+            break
+        estimated_scale = math.sqrt(target_data_bytes / max(1, len(smallest.data))) * 0.98
+        scale = max(minimum_scale, min(0.98, estimated_scale))
+        new_width = max(MIN_ARTWORK_DIMENSION, int(current_width * scale))
+        new_height = max(MIN_ARTWORK_DIMENSION, int(current_height * scale))
+        if (new_width, new_height) == image.size:
+            if current_width > MIN_ARTWORK_DIMENSION:
+                new_width = current_width - 1
+            if current_height > MIN_ARTWORK_DIMENSION:
+                new_height = current_height - 1
+        if (new_width, new_height) == image.size:
+            break
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        downscaled = True
+
+    raise ArtworkError(
+        "unable to fit artwork within the container limit without reducing it below "
+        f"{MIN_ARTWORK_DIMENSION} pixels"
     )
 
 
@@ -411,7 +591,11 @@ class ArtworkDownloader:
 
 
 __all__ = (
+    "JPEG_ALPHA_MATTE",
+    "JPEG_QUALITY_LADDER",
+    "ArtworkDerivation",
     "ArtworkDownloader",
     "build_artwork_urls",
     "decode_artwork",
+    "derive_embeddable_artwork",
 )

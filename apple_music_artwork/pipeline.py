@@ -8,7 +8,8 @@ import stat
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from .artwork import ArtworkDownloader
+from .adapters.flac import derive_flac_artwork
+from .artwork import ArtworkDerivation, ArtworkDownloader
 from .catalog import AppleCatalogClient
 from .constants import REPORT_SCHEMA_VERSION, VERSION
 from .embedding import (
@@ -18,14 +19,22 @@ from .embedding import (
     recover_transaction_journals,
 )
 from .filesystem import _open_secure_directory
+from .folder_artwork import (
+    FolderArtworkCommittedError,
+    FolderArtworkPlan,
+    plan_folder_artwork,
+    write_folder_artwork,
+)
 from .matching import choose_match, matching_basis
 from .metadata import (
     _terminal_safe,
+    album_local_diagnostics,
     discover_audio_files,
     group_tracks,
     read_track_metadata,
 )
 from .models import (
+    Artwork,
     EmbedCommittedError,
     EmbedCommittedInterrupt,
     EmbedResult,
@@ -43,6 +52,45 @@ class _ReportCommittedError(RuntimeError):
     """A report checkpoint failed after at least one file commit."""
 
     committed = True
+
+
+def _artwork_report(artwork: Artwork) -> dict[str, object]:
+    return {
+        "source_url": artwork.source_url,
+        "mime": artwork.mime,
+        "width": artwork.width,
+        "height": artwork.height,
+        "depth": artwork.depth,
+        "bytes": len(artwork.data),
+        "sha256": artwork.sha256,
+    }
+
+
+def _folder_plan_report(plan: FolderArtworkPlan) -> dict[str, object]:
+    return {
+        "status": plan.status,
+        "directory": str(plan.directory),
+        "path": str(plan.target) if plan.target is not None else None,
+        "existing_path": str(plan.existing) if plan.existing is not None else None,
+        "message": plan.message,
+    }
+
+
+def _derivation_report(derivation: ArtworkDerivation) -> dict[str, object]:
+    artwork = derivation.artwork
+    return {
+        "transformation": derivation.transformation,
+        "dimensions_retained": derivation.dimensions_retained,
+        "jpeg_quality": derivation.jpeg_quality,
+        "alpha_matte": derivation.alpha_matte,
+        "mime": artwork.mime,
+        "width": artwork.width,
+        "height": artwork.height,
+        "depth": artwork.depth,
+        "bytes": len(artwork.data),
+        "sha256": artwork.sha256,
+        "source_sha256": derivation.source_sha256,
+    }
 
 
 def process_library(
@@ -133,6 +181,7 @@ def process_library(
                 "transaction recovery did not clear every journal; refusing to continue"
             )
     selected: list[Path] = []
+    protected_omitted_paths: list[Path] = []
     dcc_omitted_files = 0
     for path in discovered:
         relative_path = path.relative_to(root)
@@ -147,6 +196,7 @@ def process_library(
         )
         if not apply_dcc and protected_prefix is not None:
             dcc_omitted_files += 1
+            protected_omitted_paths.append(path)
             detail(f"OMIT-{protected_prefix} {relative_path.as_posix()}")
             continue
         relative = relative_path.as_posix()
@@ -267,13 +317,31 @@ def process_library(
         "no_match": 0,
         "metadata_failures": sum(error["stage"] == "metadata" for error in errors),
         "adapter_preflight_failures": len(adapter_errors),
-        "failed": len(errors),
+        "failed": 0,
+        "album_failures": 0,
+        "preflight_failed_albums": 0,
+        "post_match_failed_albums": 0,
+        "catalog_lookup_failures": 0,
+        "artwork_download_failures": 0,
+        "artwork_preparation_failures": 0,
         "files_embedded": 0,
         "files_skipped": 0,
         "files_unchanged": 0,
         "file_failures": len(adapter_errors),
+        "folder_covers_written": 0,
+        "folder_covers_skipped": 0,
+        "folder_covers_unchanged": 0,
+        "folder_cover_failures": 0,
     }
     album_reports: list[dict[str, object]] = []
+
+    def add_album_failure(*, preflight: bool) -> None:
+        summary["failed"] += 1
+        summary["album_failures"] += 1
+        if preflight:
+            summary["preflight_failed_albums"] += 1
+        else:
+            summary["post_match_failed_albums"] += 1
 
     def checkpoint_report(
         active_album: dict[str, object] | None = None,
@@ -304,11 +372,14 @@ def process_library(
                 overwrite=True,
             )
         except Exception as exc:
-            if committed_path is not None or checkpoint_summary["files_embedded"]:
+            committed_writes = (
+                checkpoint_summary["files_embedded"] + checkpoint_summary["folder_covers_written"]
+            )
+            if committed_path is not None or committed_writes:
                 committed_context = (
                     f"artwork was committed to {committed_path}"
                     if committed_path is not None
-                    else f"{checkpoint_summary['files_embedded']} file(s) were already committed"
+                    else f"{committed_writes} artwork write(s) were already committed"
                 )
                 raise _ReportCommittedError(
                     f"{committed_context}, but the report checkpoint failed: {exc}"
@@ -362,6 +433,7 @@ def process_library(
             "identifier_conflicts": list(group.identifier_conflicts),
             "identifier_warnings": list(group.identifier_warnings),
             "match_basis": matching_basis(group),
+            "local_tracklist": album_local_diagnostics(group),
         }
         blocked_files = [path for path in group.files if path in adapter_errors]
         if blocked_files:
@@ -382,6 +454,7 @@ def process_library(
                     ],
                 }
             )
+            add_album_failure(preflight=True)
             album_reports.append(base_report)
             checkpoint_report()
             say(
@@ -393,6 +466,9 @@ def process_library(
         try:
             _verify_group_sources(group)
             candidates = catalog.find_candidates(group)  # type: ignore[attr-defined]
+            discovery_diagnostics = getattr(catalog, "last_discovery_diagnostics", None)
+            if isinstance(discovery_diagnostics, dict):
+                base_report["catalog_discovery"] = discovery_diagnostics
             identifier_warnings = tuple(
                 dict.fromkeys(
                     (
@@ -411,7 +487,11 @@ def process_library(
                 allow_short_releases=allow_short_releases,
             )
         except Exception as exc:
-            summary["failed"] += 1
+            discovery_diagnostics = getattr(catalog, "last_discovery_diagnostics", None)
+            if isinstance(discovery_diagnostics, dict):
+                base_report["catalog_discovery"] = discovery_diagnostics
+            summary["catalog_lookup_failures"] += 1
+            add_album_failure(preflight=False)
             base_report.update(
                 {
                     "status": "failed",
@@ -459,6 +539,7 @@ def process_library(
             "album": candidate.album,
             "release_year": candidate.release_year,
             "track_count": candidate.track_count,
+            "returned_song_count": len(candidate.tracks),
             "artwork_url": candidate.artwork_url,
             "score": round(matched.total, 6),
             "match_basis": matched.match_basis,
@@ -477,6 +558,25 @@ def process_library(
             ),
         }
         if not apply:
+            folder_preflight_error: str | None = None
+            try:
+                folder_plan = plan_folder_artwork(
+                    group,
+                    root,
+                    groups,
+                    None,
+                    replace_existing=replace_existing,
+                    protected_paths=protected_omitted_paths,
+                )
+            except Exception as exc:
+                folder_preflight_error = str(exc)
+                summary["folder_cover_failures"] += 1
+                base_report["folder_artwork"] = {
+                    "status": "preflight_failed",
+                    "message": folder_preflight_error,
+                }
+            else:
+                base_report["folder_artwork"] = _folder_plan_report(folder_plan)
             file_results: list[dict[str, str]] = []
             preflight_failures = 0
             for path in group.files:
@@ -499,13 +599,18 @@ def process_library(
                     summary["file_failures"] += 1
                     file_results.append({"path": str(path), "status": "failed", "error": str(exc)})
             base_report["file_results"] = file_results
-            if preflight_failures:
-                summary["failed"] += 1
+            if preflight_failures or folder_preflight_error is not None:
+                add_album_failure(preflight=True)
                 base_report["status"] = "preflight_failed"
-                base_report["reason"] = (
-                    f"{preflight_failures} file(s) failed non-mutating adapter preflight"
-                )
-                say(f"ERROR   {label}: {preflight_failures} file(s) failed dry-run preflight")
+                failures = []
+                if preflight_failures:
+                    failures.append(
+                        f"{preflight_failures} file(s) failed non-mutating adapter preflight"
+                    )
+                if folder_preflight_error is not None:
+                    failures.append(f"folder artwork preflight failed: {folder_preflight_error}")
+                base_report["reason"] = "; ".join(failures)
+                say(f"ERROR   {label}: {base_report['reason']}")
             else:
                 base_report["status"] = "dry-run"
                 say(
@@ -526,43 +631,89 @@ def process_library(
             )
             _verify_group_sources(group)
         except Exception as exc:
-            summary["failed"] += 1
+            summary["artwork_download_failures"] += 1
+            add_album_failure(preflight=False)
             base_report.update({"status": "failed", "reason": f"artwork download failed: {exc}"})
             album_reports.append(base_report)
             checkpoint_report()
             say(f"ERROR   {label}: artwork download failed: {exc}")
             continue
 
-        base_report["artwork"] = {
-            "source_url": artwork.source_url,
-            "mime": artwork.mime,
-            "width": artwork.width,
-            "height": artwork.height,
-            "depth": artwork.depth,
-            "sha256": artwork.sha256,
-        }
+        base_report["artwork"] = _artwork_report(artwork)
         detail(
             f"ARTWORK collection_id={candidate.collection_id} mime={artwork.mime} "
             f"dimensions={artwork.width}x{artwork.height} sha256={artwork.sha256}"
         )
-        planned: list[tuple[Path, EmbedResult]] = []
+        artwork_by_path = {path: artwork for path in group.files}
+        if any(adapter_plans[path].format == "FLAC" for path in group.files):
+            try:
+                flac_derivation = derive_flac_artwork(artwork)
+            except Exception as exc:
+                summary["artwork_preparation_failures"] += 1
+                add_album_failure(preflight=False)
+                base_report.update(
+                    {
+                        "status": "failed",
+                        "reason": f"FLAC artwork preparation failed: {exc}",
+                    }
+                )
+                album_reports.append(base_report)
+                checkpoint_report()
+                say(f"ERROR   {label}: FLAC artwork preparation failed: {exc}")
+                continue
+            for path in group.files:
+                if adapter_plans[path].format == "FLAC":
+                    artwork_by_path[path] = flac_derivation.artwork
+            base_report["embedding_artwork"] = {"FLAC": _derivation_report(flac_derivation)}
+            if flac_derivation.transformation != "source":
+                detail(
+                    f"FLAC-ARTWORK {label} transformation={flac_derivation.transformation} "
+                    f"mime={flac_derivation.artwork.mime} "
+                    f"dimensions={flac_derivation.artwork.width}x"
+                    f"{flac_derivation.artwork.height} "
+                    f"bytes={len(flac_derivation.artwork.data)}"
+                )
+
+        folder_plan: FolderArtworkPlan | None
+        try:
+            folder_plan = plan_folder_artwork(
+                group,
+                root,
+                groups,
+                artwork,
+                replace_existing=replace_existing,
+                protected_paths=protected_omitted_paths,
+            )
+        except Exception as exc:
+            folder_plan = None
+            summary["folder_cover_failures"] += 1
+            base_report["folder_artwork"] = {
+                "status": "failed",
+                "message": f"folder artwork preflight failed: {exc}",
+            }
+        else:
+            base_report["folder_artwork"] = _folder_plan_report(folder_plan)
+
+        planned: list[tuple[Path, EmbedResult, Artwork]] = []
         file_results: list[dict[str, str]] = []
         preflight_failures = 0
         for path in group.files:
             try:
+                embed_variant = artwork_by_path[path]
                 plan = preflight_artwork(
                     path,
-                    artwork,
+                    embed_variant,
                     replace_existing=replace_existing,
                     expected_identity=expected_by_path.get(path),
                 )
-                planned.append((path, plan))
+                planned.append((path, plan, embed_variant))
                 file_results.append(
                     {
                         "path": str(path),
                         "status": plan.status,
                         "format": plan.format,
                         "message": plan.message,
+                        "artwork_sha256": embed_variant.sha256,
                     }
                 )
                 detail(
@@ -574,11 +725,17 @@ def process_library(
                 summary["file_failures"] += 1
                 file_results.append({"path": str(path), "status": "failed", "error": str(exc)})
         if preflight_failures:
-            summary["failed"] += 1
+            add_album_failure(preflight=True)
             base_report["status"] = "preflight_failed"
             base_report["reason"] = (
                 f"{preflight_failures} file(s) failed; album-wide preflight prevented all writes"
             )
+            if folder_plan is not None and folder_plan.status == "ready":
+                base_report["folder_artwork"] = {
+                    **_folder_plan_report(folder_plan),
+                    "status": "not_written",
+                    "message": "album-wide audio preflight failed before any artwork write",
+                }
             base_report["file_results"] = file_results
             album_reports.append(base_report)
             checkpoint_report()
@@ -591,7 +748,7 @@ def process_library(
         file_results = []
         album_failures = 0
         album_embedded = 0
-        for path, plan in planned:
+        for path, plan, embed_variant in planned:
             if plan.status != "ready":
                 file_results.append(
                     {
@@ -621,7 +778,7 @@ def process_library(
                 )
                 result = embed_artwork(
                     path,
-                    artwork,
+                    embed_variant,
                     replace_existing=replace_existing,
                     expected_identity=expected_by_path.get(path),
                     _on_committed=persist_committed_result,
@@ -663,7 +820,7 @@ def process_library(
                 base_report["file_results"] = file_results
                 base_report["status"] = "interrupted_committed"
                 base_report["reason"] = str(exc)
-                summary["failed"] += 1
+                add_album_failure(preflight=False)
                 album_reports.append(base_report)
                 interrupted_report: dict[str, object] = {
                     "schema_version": REPORT_SCHEMA_VERSION,
@@ -715,16 +872,72 @@ def process_library(
                 ),
             )
         base_report["file_results"] = file_results
+        folder_written = False
+        folder_failure = folder_plan is None
+        if folder_plan is not None:
+            if folder_plan.status == "ready":
+                try:
+                    folder_result = write_folder_artwork(folder_plan, artwork)
+                except FolderArtworkCommittedError as exc:
+                    folder_written = True
+                    folder_failure = True
+                    summary["folder_covers_written"] += 1
+                    summary["folder_cover_failures"] += 1
+                    base_report["folder_artwork"] = {
+                        **_folder_plan_report(folder_plan),
+                        "status": "committed_unverified",
+                        "path": str(exc.path),
+                        "error": str(exc),
+                    }
+                    checkpoint_report(base_report, committed_path=exc.path)
+                except Exception as exc:
+                    folder_failure = True
+                    summary["folder_cover_failures"] += 1
+                    base_report["folder_artwork"] = {
+                        **_folder_plan_report(folder_plan),
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                else:
+                    folder_written = True
+                    summary["folder_covers_written"] += 1
+                    base_report["folder_artwork"] = {
+                        "status": folder_result.status,
+                        "path": str(folder_result.path),
+                        "message": folder_result.message,
+                        "mime": artwork.mime,
+                        "width": artwork.width,
+                        "height": artwork.height,
+                        "bytes": len(artwork.data),
+                        "sha256": artwork.sha256,
+                    }
+                    checkpoint_report(base_report, committed_path=folder_result.path)
+                    detail(
+                        f"FOLDER-ARTWORK {folder_result.path.relative_to(root).as_posix()} "
+                        f"status={folder_result.status}"
+                    )
+            elif folder_plan.status == "unchanged":
+                summary["folder_covers_unchanged"] += 1
+            elif folder_plan.status == "skipped":
+                summary["folder_covers_skipped"] += 1
+
+        if folder_failure:
+            album_failures += 1
         if album_failures:
-            summary["failed"] += 1
-            base_report["status"] = "partial_failure" if album_embedded else "failed"
+            add_album_failure(preflight=False)
+            base_report["status"] = (
+                "partial_failure" if album_embedded or folder_written else "failed"
+            )
             say(
                 f"ERROR   {label}: embedded {album_embedded}/{len(group.files)} files; "
-                f"{album_failures} failed after preflight"
+                f"{album_failures} artwork operation(s) failed after preflight"
             )
-        elif album_embedded:
+        elif album_embedded or folder_written:
             base_report["status"] = "applied"
-            say(f"APPLIED {label}: embedded {album_embedded} file(s)")
+            say(
+                f"APPLIED {label}: embedded {album_embedded} file(s); "
+                f"folder_cover={'written' if folder_written else folder_plan.status}"
+            )
         else:
             base_report["status"] = "unchanged"
             say(f"SKIPPED {label}: no file required a change")
@@ -746,9 +959,10 @@ def process_library(
         try:
             _write_json_report(report_destination, report, overwrite=True)
         except Exception as exc:
-            if summary["files_embedded"]:
+            committed_writes = summary["files_embedded"] + summary["folder_covers_written"]
+            if committed_writes:
                 raise _ReportCommittedError(
-                    f"{summary['files_embedded']} file(s) were committed, but final report "
+                    f"{committed_writes} artwork write(s) were committed, but final report "
                     f"finalization failed: {exc}"
                 ) from exc
             raise

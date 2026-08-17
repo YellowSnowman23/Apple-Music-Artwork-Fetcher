@@ -166,6 +166,8 @@ def _atomic_write_bytes(
     *,
     overwrite: bool = True,
     private_directory: bool = True,
+    file_mode: int = 0o600,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
 ) -> None:
     directory = _open_secure_directory(
         path.parent,
@@ -187,10 +189,15 @@ def _atomic_write_bytes(
                 raise OSError(f"destination is not owned by the current user: {path}")
             if not overwrite:
                 raise FileExistsError(path)
+        if expected_identity is not None:
+            if not overwrite:
+                raise ValueError("an expected destination identity requires overwrite mode")
+            if existing is None or _stat_identity(existing) != expected_identity:
+                raise OSError(f"destination changed after preflight: {path}")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory)
+        descriptor = os.open(temporary_name, flags, file_mode, dir_fd=directory)
         temporary_exists = True
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
@@ -198,6 +205,13 @@ def _atomic_write_bytes(
             handle.flush()
             os.fsync(handle.fileno())
         if overwrite:
+            if expected_identity is not None:
+                try:
+                    current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                except OSError as exc:
+                    raise OSError(f"destination changed after preflight: {path}") from exc
+                if _stat_identity(current) != expected_identity:
+                    raise OSError(f"destination changed after preflight: {path}")
             os.replace(
                 temporary_name,
                 path.name,

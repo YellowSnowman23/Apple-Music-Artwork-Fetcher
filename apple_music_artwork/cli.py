@@ -30,7 +30,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="atomically embed verified artwork (without this, only report matches)",
+        help=(
+            "atomically embed verified artwork and save native cover.jpg/cover.png "
+            "(without this, only report matches)"
+        ),
     )
     parser.add_argument(
         "-v",
@@ -42,8 +45,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--replace-existing",
         action="store_true",
         help=(
-            "replace existing front covers; for supported M4A this replaces every covr item "
-            "because M4A has no front/back role"
+            "replace existing embedded front covers and differing album-folder covers; "
+            "for supported M4A this replaces every covr item because M4A has no front/back role"
         ),
     )
     parser.add_argument(
@@ -180,9 +183,20 @@ def main(argv: list[str] | None = None) -> int:
         f"dcc_omitted={summary.get('dcc_omitted_files', 0)} "
         f"metadata_failures={summary.get('metadata_failures', 0)} "
         f"failed={summary.get('failed', 0)} "
-        f"embedded={summary.get('files_embedded', 0)}"
+        f"embedded={summary.get('files_embedded', 0)} "
+        f"folder_covers={summary.get('folder_covers_written', 0)}"
     )
-    return 1 if int(summary.get("failed", 0)) else 0
+    has_failures = any(
+        int(summary.get(field, 0))
+        for field in (
+            "failed",
+            "metadata_failures",
+            "adapter_preflight_failures",
+            "file_failures",
+            "folder_cover_failures",
+        )
+    )
+    return 1 if has_failures else 0
 
 
 __all__ = ("main",)

@@ -10,6 +10,7 @@ from apple_artwork import (
     AppleCatalogClient,
     TrackMetadata,
     candidate_ids_from_album_search,
+    catalog_albums_from_lookup,
 )
 from apple_music_artwork.models import MusicBrainzRelease
 from apple_music_artwork.musicbrainz import MusicBrainzClient, _ResolvedMusicBrainzRelease
@@ -180,6 +181,130 @@ def _client(
             api_interval=0,
         ),
         session,
+    )
+
+
+def test_strict_lookup_accepts_complete_song_rows_when_collection_count_includes_video() -> None:
+    rows = _album_rows(99)
+    rows[0]["trackCount"] = 2
+    rows[1]["trackCount"] = 1
+    rows.append(
+        {
+            "wrapperType": "track",
+            "kind": "music-video",
+            "collectionId": 99,
+            "trackName": "Bonus Video",
+        }
+    )
+
+    albums = catalog_albums_from_lookup(rows)
+
+    assert len(albums) == 1
+    assert albums[0].track_count == 1
+    assert len(albums[0].tracks) == 1
+
+
+def test_strict_lookup_rejects_an_unproven_collection_count_mismatch() -> None:
+    rows = _album_rows(99)
+    rows[0]["trackCount"] = 2
+
+    assert catalog_albums_from_lookup(rows) == []
+
+
+def test_embedded_upc_retains_an_artwork_bearing_collection_without_song_rows(
+    tmp_path: Path,
+) -> None:
+    client, _session = _client(
+        tmp_path,
+        payloads=[{"results": [_album_rows(99)[0]]}],
+        musicbrainz=FakeMusicBrainzClient(),
+    )
+
+    albums = client.find_candidates(_group(barcode=BARCODE, release_id=None))
+
+    assert [album.collection_id for album in albums] == [99]
+    assert albums[0].tracks == ()
+    assert albums[0].track_count == 1
+    assert albums[0].identifier_resolution == "embedded_upc"
+    assert client.last_identifier_warnings == (
+        "embedded UPC: Apple collection 99 returned no song rows; direct identifier "
+        "evidence retained the artwork-bearing collection",
+    )
+    diagnostics = client.last_discovery_diagnostics
+    json.dumps(diagnostics)
+    assert diagnostics["candidate_count"] == 1
+    assert diagnostics["stages"]["embedded_upc"] == {
+        "raw_rows": 1,
+        "collection_rows": 1,
+        "song_rows": 0,
+        "requested_collections": 1,
+        "parsed_collections": 1,
+        "rejected_collections": 0,
+        "rejection_reasons": {},
+        "parser_warnings": [
+            "Apple collection 99 returned no song rows; direct identifier evidence retained "
+            "the artwork-bearing collection"
+        ],
+    }
+
+
+def test_musicbrainz_relation_retains_noncontiguous_provider_topology(
+    tmp_path: Path,
+) -> None:
+    release = MusicBrainzRelease(
+        release_id=RELEASE_ID,
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=2,
+        barcode=None,
+        apple_collection_ids=(99,),
+    )
+    rows = _album_rows(99, count=2)
+    rows[2]["trackNumber"] = 3
+    client, _session = _client(
+        tmp_path,
+        payloads=[{"results": rows}],
+        musicbrainz=FakeMusicBrainzClient(release),
+    )
+
+    albums = client.find_candidates(_group())
+
+    assert [album.collection_id for album in albums] == [99]
+    assert [track.track_number for track in albums[0].tracks] == [1, 3]
+    assert albums[0].identifier_resolution == "musicbrainz_apple_relation"
+    assert client.last_identifier_warnings == (
+        "MusicBrainz Apple relationship: Apple collection 99 returned non-contiguous "
+        "disc/track topology; direct identifier evidence retained the provider presentation",
+    )
+
+
+def test_musicbrainz_barcode_retains_collection_only_identifier_result(
+    tmp_path: Path,
+) -> None:
+    release = MusicBrainzRelease(
+        release_id=RELEASE_ID,
+        title="Canonical Album",
+        artist="Canonical Artist",
+        release_year=2024,
+        track_count=1,
+        barcode=BARCODE,
+    )
+    client, _session = _client(
+        tmp_path,
+        payloads=[{"results": [_album_rows(99)[0]]}],
+        musicbrainz=FakeMusicBrainzClient(release),
+    )
+
+    albums = client.find_candidates(_group())
+
+    assert [album.collection_id for album in albums] == [99]
+    assert albums[0].tracks == ()
+    assert albums[0].verified_barcode == BARCODE
+    assert albums[0].identifier_resolution == "musicbrainz_barcode"
+    assert client.last_identifier_warnings == (
+        "MusicBrainz barcode: Apple collection 99 returned no song rows; direct identifier "
+        "evidence retained the artwork-bearing collection",
     )
 
 
@@ -767,11 +892,11 @@ def test_failed_embedded_upc_can_continue_through_a_consistent_mbid_relation(
     assert session.calls[0][1]["upc"] == BARCODE
     assert session.calls[1][1]["id"] == "99"
     assert client.last_identifier_warnings == (
-        "the embedded UPC returned no usable complete Apple album",
+        "the embedded UPC returned no usable artwork-bearing Apple collection",
     )
 
 
-def test_mbid_search_filters_count_year_and_explicit_remaster_before_lookup(
+def test_mbid_search_defers_count_and_year_gates_until_after_lookup(
     tmp_path: Path,
 ) -> None:
     group = _group()
@@ -822,11 +947,25 @@ def test_mbid_search_filters_count_year_and_explicit_remaster_before_lookup(
         payloads=[
             {"results": search_rows},
             {
-                "results": _album_rows(
-                    99,
-                    album="Canonical Album (2011 Remaster)",
-                    artist="Canonical Artist",
-                )
+                "results": [
+                    *_album_rows(
+                        99,
+                        album="Canonical Album (2011 Remaster)",
+                        artist="Canonical Artist",
+                    ),
+                    *_album_rows(
+                        102,
+                        album="Canonical Album (2011 Remaster)",
+                        artist="Canonical Artist",
+                        year=2028,
+                    ),
+                    *_album_rows(
+                        100,
+                        album="Canonical Album (2011 Remaster)",
+                        artist="Canonical Artist",
+                        count=2,
+                    ),
+                ]
             },
         ],
         musicbrainz=FakeMusicBrainzClient(release),
@@ -835,9 +974,36 @@ def test_mbid_search_filters_count_year_and_explicit_remaster_before_lookup(
     albums = client.find_candidates(group)
 
     assert [album.collection_id for album in albums] == [99]
-    assert session.calls[1][1]["id"] == "99"
+    assert session.calls[1][1]["id"] == "99,102,100"
     album = albums[0]
     assert album.identifier_resolution == "musicbrainz_search"
+    diagnostics = client.last_discovery_diagnostics
+    json.dumps(diagnostics)
+    assert diagnostics["resolved_musicbrainz"] == {
+        "status": "resolved",
+        "requested_release_id": RELEASE_ID,
+        "resolved_release_id": RELEASE_ID,
+        "canonical_alias": False,
+        "title": "Canonical Album (2011 Remaster)",
+        "artist": "Canonical Artist",
+        "track_count": 1,
+        "release_year": 2024,
+        "barcode": None,
+        "apple_collection_ids": [],
+        "recording_id_count": 0,
+    }
+    search_diagnostics = diagnostics["stages"]["album_search"]
+    assert search_diagnostics["raw_rows"] == 4
+    assert search_diagnostics["selected_collections"] == 3
+    assert search_diagnostics["rejected_collections"] == 1
+    assert search_diagnostics["rejection_reasons"] == {"explicit remaster-year conflict": 1}
+    assert search_diagnostics["lookup"]["parsed_collections"] == 3
+    assert search_diagnostics["postlookup_accepted_collections"] == 1
+    assert search_diagnostics["postlookup_rejected_collections"] == 2
+    assert search_diagnostics["postlookup_rejection_reasons"] == {
+        "resolved MusicBrainz release-year mismatch": 1,
+        "resolved MusicBrainz track-count mismatch": 1,
+    }
     assert album.verified_musicbrainz_release_id == RELEASE_ID
     assert album.resolved_musicbrainz_title == release.title
     assert album.resolved_musicbrainz_artist == release.artist

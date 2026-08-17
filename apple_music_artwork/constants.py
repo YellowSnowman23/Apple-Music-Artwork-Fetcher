@@ -2,12 +2,12 @@
 
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 USER_AGENT = (
     f"AppleMusicArtworkEmbedder/{VERSION} "
     "(https://github.com/YellowSnowman23/Apple-Music-Artwork-Fetcher)"
 )
-REPORT_SCHEMA_VERSION = 3
+REPORT_SCHEMA_VERSION = 4
 
 MAX_ARTWORK_BYTES = 128 * 1024 * 1024
 MAX_API_BYTES = 8 * 1024 * 1024

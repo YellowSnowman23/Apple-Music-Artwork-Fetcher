@@ -21,6 +21,7 @@ MODULES = (
     "constants",
     "embedding",
     "filesystem",
+    "folder_artwork",
     "matching",
     "metadata",
     "models",
@@ -87,8 +88,8 @@ def test_release_version_is_consistent_with_project_metadata() -> None:
     project_version = re.search(r'^version = "([^"]+)"$', project_text, re.MULTILINE)
 
     assert project_version is not None
-    assert project_version.group(1) == VERSION == "3.0.0"
-    assert REPORT_SCHEMA_VERSION == 3
+    assert project_version.group(1) == VERSION == "3.1.0"
+    assert REPORT_SCHEMA_VERSION == 4
 
 
 def test_cli_reports_current_release(capsys: pytest.CaptureFixture[str]) -> None:

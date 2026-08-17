@@ -386,7 +386,7 @@ def test_catalog_client_does_not_fuzzy_match_an_unresolved_upc(tmp_path: Path) -
     assert client.find_candidates(group) == []
     assert len(session.calls) == 1
     assert client.last_identifier_warnings == (
-        "the embedded UPC returned no usable complete Apple album",
+        "the embedded UPC returned no usable artwork-bearing Apple collection",
     )
 
 

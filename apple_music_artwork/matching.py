@@ -1300,7 +1300,13 @@ def _score_identifier_candidate(
     if conflicting_musicbrainz:
         reasons.append("MusicBrainz release ID mismatch")
     if remote_count != remote_song_count:
-        reasons.append("Apple tracklist appears incomplete")
+        if direct_identifier:
+            warnings.append(
+                "Apple returned an incomplete or unavailable song tracklist; direct "
+                "identifier evidence retained the collection"
+            )
+        else:
+            reasons.append("Apple tracklist appears incomplete")
     if local_count != remote_count:
         if direct_identifier:
             warnings.append(
@@ -1626,6 +1632,89 @@ def _duration_fingerprint_breaks_tie(
     return best_distance + 100 <= runner_distance and best_distance <= runner_distance * 0.90
 
 
+def _has_direct_identifier_evidence(score: CandidateScore) -> bool:
+    return bool(
+        score.components.get("verified_upc") == 1.0
+        or (
+            score.components.get("verified_musicbrainz") == 1.0
+            and score.candidate.identifier_resolution
+            in {"musicbrainz_apple_relation", "musicbrainz_barcode"}
+        )
+    )
+
+
+def _has_proven_complete_catalog_count(candidate: CatalogAlbum) -> bool:
+    if not candidate.tracks or candidate.track_count != len(candidate.tracks):
+        return False
+    positions = _complete_positions(candidate.tracks)
+    if positions is None:
+        return False
+    by_disc: dict[int, set[int]] = defaultdict(set)
+    for disc, number in positions:
+        by_disc[disc].add(number)
+    return set(by_disc) == set(range(1, max(by_disc, default=0) + 1)) and all(
+        numbers == set(range(1, max(numbers) + 1)) for numbers in by_disc.values()
+    )
+
+
+def _unique_direct_identifier_evidence_winner(
+    eligible: list[CandidateScore],
+) -> tuple[CandidateScore, str] | None:
+    """Resolve direct-identifier collisions only with one clearly unique fingerprint.
+
+    Exact identifier lookups can legitimately return multiple Apple collections.  Artwork
+    differences remain ambiguous unless local release size or a strong order-independent
+    duration fingerprint identifies exactly one of them.  Conflicting count and duration
+    winners deliberately leave the result ambiguous.
+    """
+    if len(eligible) < 2 or not all(_has_direct_identifier_evidence(score) for score in eligible):
+        return None
+
+    exact_count = [
+        score
+        for score in eligible
+        if score.components.get("track_count") == 1.0
+        and _has_proven_complete_catalog_count(score.candidate)
+    ]
+    count_winner = exact_count[0] if len(exact_count) == 1 else None
+
+    duration_ranked = sorted(
+        eligible,
+        key=lambda score: (
+            -min(
+                score.components.get("duration_coverage", 0.0),
+                score.components.get("duration_multiset", 0.0),
+            ),
+            score.candidate.collection_id,
+        ),
+    )
+    duration_winner: CandidateScore | None = None
+    duration_best = duration_ranked[0]
+    duration_quality = min(
+        duration_best.components.get("duration_coverage", 0.0),
+        duration_best.components.get("duration_multiset", 0.0),
+    )
+    runner_quality = min(
+        duration_ranked[1].components.get("duration_coverage", 0.0),
+        duration_ranked[1].components.get("duration_multiset", 0.0),
+    )
+    if duration_quality >= 0.85 and duration_quality - runner_quality >= 0.15:
+        duration_winner = duration_best
+
+    evidence = [winner for winner in (count_winner, duration_winner) if winner is not None]
+    if not evidence or any(
+        winner.candidate.collection_id != evidence[0].candidate.collection_id
+        for winner in evidence[1:]
+    ):
+        return None
+    labels = []
+    if count_winner is not None:
+        labels.append("exact local track count")
+    if duration_winner is not None:
+        labels.append("duration fingerprint")
+    return evidence[0], " and ".join(labels)
+
+
 def choose_match(
     group: AlbumGroup,
     candidates: Iterable[CatalogAlbum],
@@ -1671,7 +1760,11 @@ def choose_match(
             eligible = identifier_verified
     best = eligible[0]
     if basis != "legacy":
-        if len(eligible) > 1 and not all(
+        tie_break = _unique_direct_identifier_evidence_winner(eligible)
+        tie_break_detail: str | None = None
+        if tie_break is not None:
+            best, tie_break_detail = tie_break
+        elif len(eligible) > 1 and not all(
             _equivalent_catalog_releases(best.candidate, runner.candidate)
             and best.candidate.artwork_url == runner.candidate.artwork_url
             for runner in eligible[1:]
@@ -1696,11 +1789,14 @@ def choose_match(
             if best.components.get("verified_musicbrainz") == 1.0:
                 direct_sources.append("MusicBrainz")
             detail = "+".join(direct_sources) if direct_sources else basis
+        reason = f"identifier-first match using {detail}"
+        if tie_break_detail is not None:
+            reason += f"; uniquely supported by {tie_break_detail}"
         return MatchDecision(
             "matched",
             best,
             scores,
-            f"identifier-first match using {detail}",
+            reason,
         )
     if best.total < min_score:
         return MatchDecision(

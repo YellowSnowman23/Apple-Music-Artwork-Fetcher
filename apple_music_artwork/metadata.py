@@ -156,6 +156,16 @@ def _number_pair(value: str) -> tuple[int | None, int | None]:
     return number, total
 
 
+def _standalone_total(value: str) -> int | None:
+    if not value or len(value) > 32:
+        return None
+    match = re.fullmatch(r"\s*(\d{1,4})\s*", value)
+    if not match:
+        return None
+    total = int(match.group(1))
+    return total if 1 <= total <= 9999 else None
+
+
 def _year(value: str) -> int | None:
     match = re.search(r"(?<!\d)(?:18|19|20|21)\d{2}(?!\d)", value)
     return int(match.group()) if match else None
@@ -250,8 +260,12 @@ def read_track_metadata(
     album = _first_tag(tags, "album")
     artist = _first_tag(tags, "artist")
     album_artist = _first_tag(tags, "albumartist", "album artist") or artist
-    track_number, track_total = _number_pair(_first_tag(tags, "tracknumber"))
-    disc_number, disc_total = _number_pair(_first_tag(tags, "discnumber"))
+    track_number, paired_track_total = _number_pair(_first_tag(tags, "tracknumber"))
+    standalone_track_total = _standalone_total(_first_tag(tags, "tracktotal", "totaltracks"))
+    track_total = standalone_track_total or paired_track_total
+    disc_number, paired_disc_total = _number_pair(_first_tag(tags, "discnumber"))
+    standalone_disc_total = _standalone_total(_first_tag(tags, "disctotal", "totaldiscs"))
+    disc_total = standalone_disc_total or paired_disc_total
     date = _first_tag(tags, "date", "year", "originaldate")
     barcode, barcode_warnings = _identifier_tag(
         tags,
@@ -312,11 +326,50 @@ def read_track_metadata(
     )
 
 
+def _release_directory_anchor(track: TrackMetadata) -> Path:
+    """Return the nearest directory that identifies this tagged release on disk."""
+    parent = track.path.parent
+    normalized_album = normalize_text(track.album)
+    if normalized_album:
+        for candidate in (parent, *parent.parents):
+            if normalize_text(candidate.name) == normalized_album:
+                return candidate
+
+    # A release root can contain conventional disc/format subdirectories even
+    # when its folder name is not byte-for-byte equivalent to the album tag.
+    # Peel only those unambiguous layout components; an ordinary sibling name
+    # remains its own anchor, which prevents distinct editions whose tags
+    # normalize alike from being collapsed together.
+    anchor = parent
+    while anchor != anchor.parent and _is_release_layout_directory(anchor.name):
+        anchor = anchor.parent
+    return anchor
+
+
+def _is_release_layout_directory(name: str) -> bool:
+    normalized = normalize_text(name)
+    if normalized in {
+        "aac",
+        "aiff",
+        "alac",
+        "flac",
+        "lossless",
+        "m4a",
+        "mp3",
+        "ogg",
+        "opus",
+        "wav",
+        "wave",
+    }:
+        return True
+    return bool(re.fullmatch(r"(?:cd|disc|disk)\s*\d{1,3}", normalized))
+
+
 def _tag_release_identity(track: TrackMetadata) -> tuple[object, ...]:
     return (
         normalize_text(track.album_artist or track.artist),
         normalize_text(track.album),
-        track.year,
+        _release_directory_anchor(track),
     )
 
 
@@ -339,6 +392,140 @@ def _logical_position_key(track: TrackMetadata) -> tuple[object, ...] | None:
         track.track_number,
         _duplicate_track_title_identity(track.title),
     )
+
+
+def album_local_diagnostics(group: AlbumGroup) -> dict[str, object]:
+    """Return JSON-ready local release topology and declaration diagnostics."""
+    tracks = tuple(group.logical_tracks)
+    years = sorted({track.year for track in tracks if track.year is not None})
+    declared_disc_totals = sorted(
+        {track.disc_total for track in tracks if track.disc_total is not None}
+    )
+    positions_by_disc: dict[int, set[int]] = defaultdict(set)
+    totals_by_disc: dict[int, set[int]] = defaultdict(set)
+    unpositioned_track_count = 0
+    for track in tracks:
+        disc = track.disc_number or 1
+        if track.track_number is None:
+            unpositioned_track_count += 1
+        else:
+            positions_by_disc[disc].add(track.track_number)
+        if track.track_total is not None:
+            totals_by_disc[disc].add(track.track_total)
+
+    discs = sorted(
+        {
+            *(track.disc_number or 1 for track in tracks),
+            *totals_by_disc,
+        }
+    )
+    actual_disc_numbers = set(discs)
+    missing_disc_numbers: list[int] = []
+    if len(declared_disc_totals) == 1:
+        declared_disc_total = declared_disc_totals[0]
+        missing_disc_numbers = sorted(set(range(1, declared_disc_total + 1)) - actual_disc_numbers)
+
+    track_total_conflicts = [
+        {"disc": disc, "values": sorted(values)}
+        for disc, values in sorted(totals_by_disc.items())
+        if len(values) > 1
+    ]
+    all_track_totals = {total for values in totals_by_disc.values() for total in values}
+    positioned_track_count = sum(len(positions) for positions in positions_by_disc.values())
+    observed_track_count = positioned_track_count + unpositioned_track_count
+    album_wide_total = (
+        next(iter(all_track_totals))
+        if len(discs) > 1
+        and not track_total_conflicts
+        and len(all_track_totals) == 1
+        and next(iter(all_track_totals)) >= observed_track_count
+        else None
+    )
+    if track_total_conflicts:
+        track_total_scope = "conflicting"
+    elif album_wide_total is not None:
+        track_total_scope = "album"
+    elif all_track_totals:
+        track_total_scope = "disc"
+    else:
+        track_total_scope = "unknown"
+
+    track_numbers = [track.track_number for track in tracks if track.track_number is not None]
+    global_positions_are_unique = len(set(track_numbers)) == len(track_numbers)
+    position_layout = (
+        "global"
+        if track_total_scope == "album" and global_positions_are_unique
+        else "per_disc"
+        if positions_by_disc
+        else "unknown"
+    )
+
+    missing_track_positions: list[dict[str, int | None]] = []
+    out_of_range_track_positions: list[dict[str, int | None]] = []
+    per_disc: list[dict[str, object]] = []
+    for disc in discs:
+        positions = sorted(positions_by_disc.get(disc, set()))
+        totals = sorted(totals_by_disc.get(disc, set()))
+        effective_total = max(totals) if totals else None
+        missing: list[int] = []
+        out_of_range: list[int] = []
+        if track_total_scope in {"disc", "conflicting"} and effective_total is not None:
+            missing = sorted(set(range(1, effective_total + 1)) - set(positions))
+            out_of_range = [position for position in positions if position > effective_total]
+            missing_track_positions.extend(
+                {"disc": disc, "track": position} for position in missing
+            )
+            out_of_range_track_positions.extend(
+                {"disc": disc, "track": position} for position in out_of_range
+            )
+        per_disc.append(
+            {
+                "disc": disc,
+                "present_positions": positions,
+                "declared_track_totals": totals,
+                "effective_track_total": effective_total,
+                "missing_positions": missing,
+                "out_of_range_positions": out_of_range,
+            }
+        )
+
+    missing_track_count: int | None
+    if track_total_scope == "album":
+        assert album_wide_total is not None
+        missing_track_count = max(0, album_wide_total - observed_track_count)
+        if global_positions_are_unique:
+            missing = sorted(set(range(1, album_wide_total + 1)) - set(track_numbers))
+            out_of_range = [position for position in track_numbers if position > album_wide_total]
+            missing_track_positions.extend(
+                {"disc": None, "track": position} for position in missing
+            )
+            out_of_range_track_positions.extend(
+                {"disc": None, "track": position} for position in out_of_range
+            )
+    elif track_total_scope in {"disc", "conflicting"}:
+        missing_track_count = len(missing_track_positions)
+    else:
+        missing_track_count = None
+
+    return {
+        "declared_years": years,
+        "year_conflict": len(years) > 1,
+        "declared_disc_totals": declared_disc_totals,
+        "disc_total_conflict": len(declared_disc_totals) > 1,
+        "missing_disc_numbers": missing_disc_numbers,
+        "track_total_scope": track_total_scope,
+        "position_layout": position_layout,
+        "declared_track_totals": [
+            {"disc": disc, "values": sorted(values)}
+            for disc, values in sorted(totals_by_disc.items())
+        ],
+        "track_total_conflicts": track_total_conflicts,
+        "per_disc": per_disc,
+        "missing_track_positions": missing_track_positions,
+        "missing_track_count": missing_track_count,
+        "out_of_range_track_positions": out_of_range_track_positions,
+        "unpositioned_track_count": unpositioned_track_count,
+    }
 
 
 def group_tracks(tracks: Iterable[TrackMetadata]) -> list[AlbumGroup]:
@@ -419,6 +606,7 @@ def group_tracks(tracks: Iterable[TrackMetadata]) -> list[AlbumGroup]:
             ):
                 logical[compatible_key] = track
         first = members[0]
+        years = {track.year for track in members if track.year is not None}
         release_ids = {
             release_id
             for track in members
@@ -472,7 +660,7 @@ def group_tracks(tracks: Iterable[TrackMetadata]) -> list[AlbumGroup]:
             AlbumGroup(
                 album=first.album,
                 album_artist=first.album_artist or first.artist,
-                year=first.year,
+                year=next(iter(years)) if len(years) == 1 else None,
                 files=tuple(sorted((track.path for track in members), key=str)),
                 logical_tracks=tuple(logical.values()),
                 barcode=barcode,
@@ -493,6 +681,7 @@ def group_tracks(tracks: Iterable[TrackMetadata]) -> list[AlbumGroup]:
 
 
 __all__ = (
+    "album_local_diagnostics",
     "discover_audio_files",
     "group_tracks",
     "read_track_metadata",

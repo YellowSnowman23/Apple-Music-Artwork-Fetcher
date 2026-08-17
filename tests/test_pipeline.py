@@ -26,13 +26,14 @@ from apple_artwork import (
     decode_artwork,
     process_library,
 )
+from apple_music_artwork.artwork import ArtworkDerivation
 from apple_music_artwork.constants import VERSION
 
 
 def local_tracks(root: Path) -> tuple[TrackMetadata, ...]:
-    return (
+    tracks = (
         TrackMetadata(
-            root / "Odd" / "Depth" / "01.flac",
+            root / "Alpha" / "Greatest Hits" / "Odd" / "01.flac",
             "First Light",
             "Alpha",
             "Greatest Hits",
@@ -45,7 +46,7 @@ def local_tracks(root: Path) -> tuple[TrackMetadata, ...]:
             180_000,
         ),
         TrackMetadata(
-            root / "Formats" / "FLAC" / "02.flac",
+            root / "Alpha" / "Greatest Hits" / "FLAC" / "02.flac",
             "Home Again",
             "Alpha",
             "Greatest Hits",
@@ -58,7 +59,7 @@ def local_tracks(root: Path) -> tuple[TrackMetadata, ...]:
             200_000,
         ),
         TrackMetadata(
-            root / "Formats" / "MP3" / "03.mp3",
+            root / "Alpha" / "Greatest Hits" / "MP3" / "03.mp3",
             "Afterglow",
             "Alpha",
             "Greatest Hits",
@@ -71,6 +72,10 @@ def local_tracks(root: Path) -> tuple[TrackMetadata, ...]:
             225_000,
         ),
     )
+    for track in tracks:
+        track.path.parent.mkdir(parents=True, exist_ok=True)
+        track.path.write_bytes(b"disposable test audio")
+    return tracks
 
 
 def apple_album() -> CatalogAlbum:
@@ -110,6 +115,34 @@ class NeverDownload:
         raise AssertionError("dry-run must not download artwork")
 
 
+class EmptyDiagnosticClient:
+    """Synthetic catalog client that exposes a fully empty discovery trace."""
+
+    last_identifier_warnings: tuple[str, ...] = ()
+
+    def __init__(self) -> None:
+        self.last_discovery_diagnostics: dict[str, object] = {}
+
+    def find_candidates(self, group: AlbumGroup) -> list[CatalogAlbum]:
+        self.last_discovery_diagnostics = {
+            "match_basis": "legacy",
+            "resolved_musicbrainz": None,
+            "stages": {
+                "album_search": {
+                    "raw_rows": 0,
+                    "raw_collections": 0,
+                    "selected_collections": 0,
+                    "rejected_collections": 0,
+                    "rejection_reasons": {},
+                    "selected_collection_ids": [],
+                }
+            },
+            "candidate_count": 0,
+            "warning_count": 0,
+        }
+        return []
+
+
 def test_process_library_dry_run_matches_but_never_downloads_or_embeds(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -143,7 +176,7 @@ def test_process_library_dry_run_matches_but_never_downloads_or_embeds(
     )
 
     assert report["mode"] == "dry-run"
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
     assert report["program_version"] == VERSION
     assert report["summary"]["matched"] == 1
     assert report["summary"]["matched_by_identifier"] == 0
@@ -165,6 +198,46 @@ def test_process_library_dry_run_matches_but_never_downloads_or_embeds(
     assert preflighted == sorted((track.path for track in tracks), key=str)
     assert any("DRY-RUN" in line for line in emitted)
     assert not any(line.startswith("VERBOSE ") for line in emitted)
+
+
+def test_dry_run_reports_a_folder_cover_preflight_that_apply_cannot_satisfy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_tracks = local_tracks(tmp_path)
+    disc_directory = tmp_path / "Alpha" / "Disc 1"
+    disc_directory.mkdir(parents=True)
+    tracks = tuple(
+        replace(track, path=disc_directory / f"{index:02d}.flac")
+        for index, track in enumerate(source_tracks, 1)
+    )
+    for track in tracks:
+        track.path.write_bytes(b"disposable test audio")
+    monkeypatch.setattr(
+        pipeline,
+        "discover_audio_files",
+        lambda _root: [track.path for track in tracks],
+    )
+    by_path = {track.path: track for track in tracks}
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
+    monkeypatch.setattr(
+        pipeline,
+        "preflight_artwork",
+        lambda path, *_args, **_kwargs: EmbedResult("ready", path.suffix, "safe"),
+    )
+
+    report = process_library(
+        tmp_path,
+        client=FakeClient([apple_album()]),
+        downloader=NeverDownload(),
+        report_path=None,
+        emit=lambda _line: None,
+    )
+
+    assert report["albums"][0]["status"] == "preflight_failed"
+    assert report["albums"][0]["folder_artwork"]["status"] == "preflight_failed"
+    assert report["summary"]["folder_cover_failures"] == 1
+    assert report["summary"]["failed"] == 1
 
 
 def test_process_library_verbose_emits_progress_and_candidate_diagnostics(
@@ -207,6 +280,70 @@ def test_process_library_verbose_emits_progress_and_candidate_diagnostics(
     assert sum(line.startswith("VERBOSE PREFLIGHT ") for line in emitted) == 3
 
 
+def test_no_match_serializes_local_tracklist_and_zero_candidate_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    album_dir = tmp_path / "Synthetic Artist" / "Incomplete Album"
+    tracks = (
+        TrackMetadata(
+            album_dir / "01.flac",
+            "Opening",
+            "Synthetic Artist",
+            "Incomplete Album",
+            "Synthetic Artist",
+            2024,
+            1,
+            3,
+            1,
+            1,
+            180_000,
+        ),
+        TrackMetadata(
+            album_dir / "03.flac",
+            "Closing",
+            "Synthetic Artist",
+            "Incomplete Album",
+            "Synthetic Artist",
+            2024,
+            3,
+            3,
+            1,
+            1,
+            200_000,
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "discover_audio_files",
+        lambda _root: [track.path for track in tracks],
+    )
+    by_path = {track.path: track for track in tracks}
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
+    monkeypatch.setattr(
+        pipeline,
+        "preflight_artwork",
+        lambda path, *_args, **_kwargs: EmbedResult("ready", path.suffix, "safe"),
+    )
+
+    report = process_library(
+        tmp_path,
+        client=EmptyDiagnosticClient(),
+        downloader=NeverDownload(),
+        report_path=None,
+        emit=lambda _line: None,
+    )
+
+    album = report["albums"][0]
+    assert album["status"] == "no_match"
+    assert album["candidates"] == []
+    assert album["local_tracklist"]["track_total_scope"] == "disc"
+    assert album["local_tracklist"]["missing_track_count"] == 1
+    assert album["local_tracklist"]["missing_track_positions"] == [{"disc": 1, "track": 2}]
+    assert album["catalog_discovery"]["candidate_count"] == 0
+    assert album["catalog_discovery"]["stages"]["album_search"]["raw_rows"] == 0
+
+
 def test_process_library_reports_identifier_provenance_and_resolution_warnings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -225,7 +362,7 @@ def test_process_library_reports_identifier_provenance_and_resolution_warnings(
         "preflight_artwork",
         lambda path, *_args, **_kwargs: EmbedResult("ready", path.suffix, "safe"),
     )
-    warning = "MusicBrainz Apple relationship returned no usable complete album"
+    warning = "MusicBrainz Apple relationship returned no usable artwork-bearing Apple collection"
     client = FakeClient(
         [
             replace(
@@ -514,7 +651,10 @@ def test_apply_pipeline_scans_matches_downloads_embeds_and_writes_report(
 
     assert report["summary"]["albums"] == 1
     assert report["summary"]["files_embedded"] == 3
+    assert report["summary"]["folder_covers_written"] == 1
     assert report["albums"][0]["status"] == "applied"
+    assert report["albums"][0]["folder_artwork"]["status"] == "written"
+    assert report["albums"][0]["embedding_artwork"]["FLAC"]["transformation"] == "source"
     assert any(
         line.startswith("VERBOSE ARTWORK collection_id=4242 mime=image/png dimensions=64x64")
         for line in emitted
@@ -537,6 +677,139 @@ def test_apply_pipeline_scans_matches_downloads_embeds_and_writes_report(
     mp4 = MP4(paths[2])
     assert mp4.tags is not None
     assert [bytes(cover) for cover in mp4.tags["covr"]] == [artwork.data]
+    assert (tmp_path / "Alpha" / "Pipeline Album" / "cover.png").read_bytes() == artwork.data
+
+
+def test_pipeline_embeds_flac_derivative_but_saves_exact_source_folder_cover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = (
+        tmp_path / "Alpha" / "Pipeline Album" / "01.flac",
+        tmp_path / "Alpha" / "Pipeline Album" / "02.mp3",
+    )
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"disposable audio")
+    tracks = (
+        TrackMetadata(
+            paths[0],
+            "First Light",
+            "Alpha",
+            "Pipeline Album",
+            "Alpha",
+            2020,
+            1,
+            2,
+            1,
+            1,
+            180_000,
+        ),
+        TrackMetadata(
+            paths[1],
+            "Home Again",
+            "Alpha",
+            "Pipeline Album",
+            "Alpha",
+            2020,
+            2,
+            2,
+            1,
+            1,
+            200_000,
+        ),
+    )
+    monkeypatch.setattr(pipeline, "discover_audio_files", lambda _root: list(paths))
+    by_path = {track.path: track for track in tracks}
+    monkeypatch.setattr(pipeline, "read_track_metadata", by_path.get)
+
+    source_buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (12, 34, 56)).save(source_buffer, format="PNG")
+    source = decode_artwork(source_buffer.getvalue(), "https://a5.mzstatic.com/source.png")
+    derived_buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (12, 34, 56)).save(derived_buffer, format="JPEG")
+    derived = decode_artwork(derived_buffer.getvalue(), "https://a5.mzstatic.com/source.png")
+    derivation = ArtworkDerivation(
+        derived,
+        source.sha256,
+        source.mime,
+        source.width,
+        source.height,
+        len(source.data),
+        "jpeg_reencoded",
+        95,
+    )
+    monkeypatch.setattr(pipeline, "derive_flac_artwork", lambda _artwork: derivation)
+
+    seen_preflight: list[tuple[Path, str | None]] = []
+
+    def fake_preflight(
+        path: Path,
+        artwork: Artwork | None = None,
+        **_kwargs: object,
+    ) -> EmbedResult:
+        seen_preflight.append((path, artwork.sha256 if artwork is not None else None))
+        format_name = "FLAC" if path.suffix == ".flac" else "MP3"
+        return EmbedResult("ready", format_name, "safe")
+
+    embedded: list[tuple[Path, str]] = []
+
+    def fake_embed(path: Path, artwork: Artwork, **_kwargs: object) -> EmbedResult:
+        embedded.append((path, artwork.sha256))
+        format_name = "FLAC" if path.suffix == ".flac" else "MP3"
+        return EmbedResult("embedded", format_name, "done")
+
+    monkeypatch.setattr(pipeline, "preflight_artwork", fake_preflight)
+    monkeypatch.setattr(pipeline, "embed_artwork", fake_embed)
+    candidate = CatalogAlbum(
+        4242,
+        "Pipeline Album",
+        "Alpha",
+        2020,
+        "https://is1-ssl.mzstatic.com/example.jpg",
+        2,
+        (
+            CatalogTrack("First Light", "Alpha", 180_000, 1, 1),
+            CatalogTrack("Home Again", "Alpha", 200_000, 1, 2),
+        ),
+    )
+
+    class FixedDownloader:
+        def fetch(self, *_args: object, **_kwargs: object) -> Artwork:
+            return source
+
+    report = process_library(
+        tmp_path,
+        apply=True,
+        client=FakeClient([candidate]),
+        downloader=FixedDownloader(),
+        report_path=None,
+        allow_short_releases=True,
+        emit=lambda _line: None,
+    )
+
+    assert (paths[0], derived.sha256) in seen_preflight
+    assert (paths[1], source.sha256) in seen_preflight
+    assert embedded == [(paths[0], derived.sha256), (paths[1], source.sha256)]
+    assert (paths[0].parent / "cover.png").read_bytes() == source.data
+    album = report["albums"][0]
+    assert album["artwork"]["sha256"] == source.sha256
+    assert album["artwork"]["mime"] == "image/png"
+    assert album["folder_artwork"] == {
+        "status": "written",
+        "path": str(paths[0].parent / "cover.png"),
+        "message": "write native image/png source artwork",
+        "mime": "image/png",
+        "width": source.width,
+        "height": source.height,
+        "bytes": len(source.data),
+        "sha256": source.sha256,
+    }
+    flac_artwork = album["embedding_artwork"]["FLAC"]
+    assert flac_artwork["transformation"] == "jpeg_reencoded"
+    assert flac_artwork["source_sha256"] == source.sha256
+    assert flac_artwork["sha256"] == derived.sha256
+    assert flac_artwork["mime"] == "image/jpeg"
 
 
 def test_apply_preflights_entire_album_before_any_embed(
@@ -580,8 +853,13 @@ def test_apply_preflights_entire_album_before_any_embed(
 
     assert embedded == []
     assert report["albums"][0]["status"] == "preflight_failed"
+    assert report["summary"]["metadata_failures"] == 0
+    assert report["summary"]["adapter_preflight_failures"] == 1
     assert report["summary"]["file_failures"] == 1
     assert report["summary"]["failed"] == 1
+    assert report["summary"]["album_failures"] == 1
+    assert report["summary"]["preflight_failed_albums"] == 1
+    assert report["summary"]["post_match_failed_albums"] == 0
 
 
 def test_metadata_failures_are_visible_nonzero_and_terminal_safe(tmp_path: Path) -> None:
@@ -592,7 +870,12 @@ def test_metadata_failures_are_visible_nonzero_and_terminal_safe(tmp_path: Path)
     report = process_library(tmp_path, report_path=None, emit=emitted.append)
 
     assert report["summary"]["metadata_failures"] == 1
-    assert report["summary"]["failed"] == 1
+    assert report["summary"]["adapter_preflight_failures"] == 0
+    assert report["summary"]["file_failures"] == 0
+    assert report["summary"]["failed"] == 0
+    assert report["summary"]["album_failures"] == 0
+    assert report["summary"]["preflight_failed_albums"] == 0
+    assert report["summary"]["post_match_failed_albums"] == 0
     assert len(report["errors"]) == 1
     assert any("ERROR" in line for line in emitted)
     assert all("\x1b" not in line for line in emitted)
@@ -629,6 +912,29 @@ def test_main_prints_stable_low_confidence_and_metadata_failure_fields(
     output = capsys.readouterr().out
     assert "low_confidence=1" in output
     assert "metadata_failures=0" in output
+
+
+def test_main_returns_nonzero_for_a_file_failure_even_without_failed_album(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "process_library",
+        lambda *_args, **_kwargs: {
+            "summary": {
+                "albums": 0,
+                "matched": 0,
+                "ambiguous": 0,
+                "low_confidence": 0,
+                "no_match": 0,
+                "metadata_failures": 1,
+                "failed": 0,
+                "files_embedded": 0,
+            }
+        },
+    )
+
+    assert apple_artwork.main(["--no-report"]) == 1
 
 
 def test_apply_rejects_nonregular_transaction_journal_without_blocking(

@@ -270,6 +270,134 @@ def test_identifier_mode_leaves_different_direct_artwork_assets_ambiguous() -> N
         assert decision.match is None
 
 
+def test_direct_identifier_uses_one_exact_track_count_to_break_an_artwork_tie() -> None:
+    group, candidate = identifier_release(barcode=BARCODE)
+    exact = replace(
+        candidate,
+        collection_id=3001,
+        verified_barcode=BARCODE,
+        artwork_url="https://example.invalid/exact.jpg",
+    )
+    expanded_tracks = (
+        *candidate.tracks,
+        CatalogTrack(
+            title="Provider Bonus 7",
+            artist="Trusted Artist",
+            duration_ms=240_000,
+            disc_number=1,
+            track_number=7,
+        ),
+        CatalogTrack(
+            title="Provider Bonus 8",
+            artist="Trusted Artist",
+            duration_ms=250_000,
+            disc_number=1,
+            track_number=8,
+        ),
+    )
+    expanded = replace(
+        candidate,
+        collection_id=3002,
+        track_count=8,
+        tracks=expanded_tracks,
+        verified_barcode=BARCODE,
+        artwork_url="https://example.invalid/expanded.jpg",
+    )
+
+    for candidates in ([expanded, exact], [exact, expanded]):
+        decision = choose_match(group, candidates)
+        assert decision.status == "matched"
+        assert decision.match is not None
+        assert decision.match.candidate.collection_id == 3001
+        assert "uniquely supported by exact local track count" in decision.reason
+
+
+def test_direct_identifier_uses_one_strong_duration_fingerprint_to_break_an_artwork_tie() -> None:
+    group, candidate = identifier_release(barcode=BARCODE)
+    matching = replace(
+        candidate,
+        collection_id=3001,
+        verified_barcode=BARCODE,
+        artwork_url="https://example.invalid/matching.jpg",
+    )
+    different = replace(
+        candidate,
+        collection_id=3002,
+        tracks=tuple(
+            replace(track, duration_ms=(track.duration_ms or 0) + 30_000)
+            for track in candidate.tracks
+        ),
+        verified_barcode=BARCODE,
+        artwork_url="https://example.invalid/different.jpg",
+    )
+
+    for candidates in ([different, matching], [matching, different]):
+        decision = choose_match(group, candidates)
+        assert decision.status == "matched"
+        assert decision.match is not None
+        assert decision.match.candidate.collection_id == 3001
+        assert "uniquely supported by duration fingerprint" in decision.reason
+
+
+def test_direct_identifier_keeps_conflicting_count_and_duration_evidence_ambiguous() -> None:
+    group, candidate = identifier_release(barcode=BARCODE)
+    count_match = replace(
+        candidate,
+        collection_id=3001,
+        tracks=tuple(
+            replace(track, duration_ms=(track.duration_ms or 0) + 30_000)
+            for track in candidate.tracks
+        ),
+        verified_barcode=BARCODE,
+        artwork_url="https://example.invalid/count.jpg",
+    )
+    duration_match = replace(
+        candidate,
+        collection_id=3002,
+        track_count=7,
+        tracks=(
+            *candidate.tracks,
+            CatalogTrack(
+                title="Provider Bonus 7",
+                artist="Trusted Artist",
+                duration_ms=250_000,
+                disc_number=1,
+                track_number=7,
+            ),
+        ),
+        verified_barcode=BARCODE,
+        artwork_url="https://example.invalid/duration.jpg",
+    )
+
+    for candidates in ([count_match, duration_match], [duration_match, count_match]):
+        decision = choose_match(group, candidates)
+        assert decision.status == "ambiguous"
+        assert decision.match is None
+
+
+def test_direct_identifier_accepts_collection_only_lookup_with_warning() -> None:
+    group, candidate = identifier_release(barcode=BARCODE)
+    candidate = replace(candidate, tracks=(), verified_barcode=BARCODE)
+
+    decision = choose_match(group, [candidate])
+
+    assert decision.status == "matched"
+    assert decision.match is not None
+    assert any(
+        "incomplete or unavailable song tracklist" in warning for warning in decision.match.warnings
+    )
+
+
+def test_musicbrainz_search_still_rejects_collection_only_lookup() -> None:
+    group, candidate = identifier_release(release_id=RELEASE_ID)
+    candidate = replace(candidate, tracks=())
+
+    decision = choose_match(group, [candidate])
+
+    assert decision.status == "no_match"
+    assert "Apple tracklist appears incomplete" in decision.scores[0].reasons
+
+
 def test_identifier_mode_rejects_a_conflicting_verified_upc() -> None:
     group, candidate = identifier_release(barcode=BARCODE)
     candidate = replace(candidate, verified_barcode="4006381333931")

@@ -1,11 +1,11 @@
 # Apple Music Artwork Fetcher and Embedder
 
-Find high-resolution album artwork through Apple's public iTunes catalog and `mzstatic` CDN, identify releases from embedded UPC and MusicBrainz tags first, and embed the image into supported audio files. When no usable identifier is present, the program falls back to conservative metadata and tracklist matching.
+Find high-resolution album artwork through Apple's public iTunes catalog and `mzstatic` CDN, identify releases from embedded UPC and MusicBrainz tags first, embed the image into supported audio files, and save the validated source image beside the album. When no usable identifier is present, the program falls back to conservative metadata and tracklist matching.
 
-Dry-run is the default. Audio files change only when you pass `--apply`.
+Dry-run is the default. Audio metadata and album-folder artwork change only when you pass `--apply`.
 
 > [!NOTE]
-> This README describes version 3.0.0. Review a dry-run report before using `--apply`.
+> This README describes version 3.1.0. Review a dry-run report before using `--apply`.
 
 ## Major updates from the original script
 
@@ -13,19 +13,19 @@ This project replaces the workflow described in the [original README][original-r
 
 | Area | Original script | Current version |
 |---|---|---|
-| Output | Saved `cover.jpg` or `cover.png` beside an album | Embeds validated front-cover artwork into supported audio files |
+| Output | Saved `cover.jpg` or `cover.png` beside an album | Embeds validated front-cover artwork and saves the exact validated source as native `cover.jpg` or `cover.png` at the album root |
 | Discovery | Expected a fixed `Artist/Album` layout | Reads embedded tags and scans eligible files recursively |
 | Matching | Picked one fuzzy artist/title result | Trusts embedded UPC and MusicBrainz release identity first; uses the strict metadata and tracklist matcher only when no valid identifier is available |
 | Safety and reporting | Optional dry run and a terminal summary | Dry-run by default, local preflight, transactional writes, and a schema-versioned JSON report |
 
 > [!IMPORTANT]
-> This version does **not** create `cover.jpg` or `cover.png`. If you only want loose folder artwork, use the [original script][original-script].
+> In `--apply` mode, the program also saves the exact highest-resolution validated source image as `cover.jpg` or `cover.png` at the unique album root. A differing existing cover is preserved unless `--replace-existing` is present.
 
 > [!IMPORTANT]
-> Tagging your collection with [MusicBrainz Picard](https://picard.musicbrainz.org/) before using this program is **highly recommended**. Version 3.0 relies heavily on correct release MBIDs, recording MBIDs, and UPC/barcode tags. Picard's Lookup and Scan/AcoustID workflows are an effective way to establish that provenance.
+> Tagging your collection with [MusicBrainz Picard](https://picard.musicbrainz.org/) before using this program is **highly recommended**. Version 3.1 relies heavily on correct release MBIDs, recording MBIDs, and UPC/barcode tags. Picard's Lookup and Scan/AcoustID workflows are an effective way to establish that provenance.
 
 > [!WARNING]
-> `--apply` edits audio metadata. Take a fresh backup or filesystem snapshot, inspect a dry-run report, and test on copies of representative albums before using it on a full library.
+> `--apply` edits audio metadata and creates or replaces album-root folder artwork. Take a fresh backup or filesystem snapshot, inspect a dry-run report, and test on copies of representative albums before using it on a full library.
 
 ## Quick start
 
@@ -39,7 +39,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
 
-# Dry run: writes a report but does not modify audio
+# Dry run: writes a report but does not modify audio or folder artwork
 apple-artwork "/path/to/Music" -v
 ```
 
@@ -55,7 +55,7 @@ Inspect `apple-artwork-report.json` before adding `--apply`. The [recommended wo
 6. Uses the conservative title, artist, duration, topology, and edition scorer only when the release has no valid UPC or release MBID.
 7. Records the match basis and any identifier or metadata warnings, and abstains when neither identifier resolution nor fallback matching establishes a candidate.
 8. Downloads and fully validates JPEG or PNG artwork from Apple's CDN.
-9. In `--apply` mode, replaces only front-cover artwork while checking that unrelated metadata and encoded audio remain unchanged.
+9. In `--apply` mode, adds or replaces only front-cover artwork while checking that unrelated metadata and encoded audio remain unchanged, and writes the exact validated source image as native `cover.jpg` or `cover.png` at the unique album root.
 
 A valid embedded UPC receives the first exact Apple lookup. A valid release MBID is then looked up at MusicBrainz when the UPC does not resolve or when both identifiers are present and need consistency validation. A direct Apple Music/iTunes URL relationship is used when available; otherwise a MusicBrainz barcode receives an exact Apple lookup. If neither direct mapping is available, the release MBID remains authoritative local provenance for an order-independent Apple candidate search. When every local track has a recording MBID, those IDs are checked against the recordings in the resolved MusicBrainz release before any Apple candidate is trusted. An exact UPC result is retained with a prominent warning when a second MBID cannot be resolved or cross-validated; a positive conflict between their barcodes, Apple collections, or recording identities stops matching.
 
@@ -107,7 +107,7 @@ Download the wheel attached to the corresponding [GitHub release][releases], the
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "/path/to/apple_music_artwork_embedder-3.0.0-py3-none-any.whl"
+python -m pip install "/path/to/apple_music_artwork_embedder-3.1.0-py3-none-any.whl"
 apple-artwork --version
 ```
 
@@ -145,7 +145,7 @@ With no `--apply`, the tool:
 - resolves embedded identifiers through Apple and, when present, MusicBrainz, including dual-ID consistency checks;
 - runs identifier-authoritative selection or the identifier-absent fallback matcher and reports candidates;
 - writes API cache entries and `apple-artwork-report.json`;
-- does not download the full artwork or change audio files.
+- does not download the full artwork or change audio files or folder covers.
 
 The root argument is optional. If omitted, the current directory is used:
 
@@ -161,10 +161,11 @@ The report path defaults to `apple-artwork-report.json` inside the library root.
 For every album, check:
 
 - the local artist, album, year, and track count;
+- the local disc/track topology, declared totals, missing positions, and grouping conflicts;
 - the `match_basis`: `upc`, `musicbrainz`, `musicbrainz+upc`, or `legacy`, which records the usable local identifier inputs; `identifier_resolution` records the actual winning path as `embedded_upc`, `musicbrainz_apple_relation`, `musicbrainz_barcode`, or `musicbrainz_search`;
 - the candidate's verified UPC, verified release MBID, and `musicbrainz_recordings_verified` result;
 - the local and resolved identifiers and any conflict, fallback, or presentation warnings;
-- component scores, coverage, and candidate rejection reasons when fallback scoring was needed;
+- discovery-stage and post-lookup validation results, plus component scores, coverage, and candidate rejection reasons when fallback scoring was needed;
 - the selected Apple collection ID when a candidate was accepted.
 
 Albums that reach local adapter preflight also include per-file results. `no_match`, `low_confidence`, and `ambiguous` albums stop before that stage and therefore do not have `file_results`.
@@ -173,13 +174,13 @@ If a release is weak or ambiguous, the program leaves it alone and explains why 
 
 ### 4. Apply accepted matches
 
-Add artwork only where no front cover exists:
+Add embedded artwork only where no front cover exists, and create a missing album-root folder cover:
 
 ```bash
 apple-artwork "/path/to/Music" --apply --overwrite-report -v
 ```
 
-Replace existing front artwork:
+Replace differing embedded front artwork and differing album-root folder covers:
 
 ```bash
 apple-artwork "/path/to/Music" \
@@ -189,7 +190,7 @@ apple-artwork "/path/to/Music" \
   -v
 ```
 
-`--replace-existing` requires `--apply`. It cannot accidentally turn a dry run into a write.
+`--replace-existing` requires `--apply`. Without it, a differing existing `cover.jpg`, `cover.jpeg`, or `cover.png` is preserved. It cannot accidentally turn a dry run into a write.
 
 ## Protected special-mastering folders
 
@@ -238,7 +239,8 @@ apple-artwork "/path/to/Music" \
 - identifier-resolution basis and warnings;
 - Apple candidate IDs, scores, eligibility, and rejection reasons where applicable;
 - per-file preflight and apply results;
-- validated artwork MIME type, dimensions, and SHA-256.
+- validated source-artwork MIME type, dimensions, and SHA-256;
+- album-root folder-cover and format-specific embed-derivation results.
 
 Verbose mode does not alter matching, network requests, or mutation behavior.
 
@@ -260,12 +262,12 @@ Discovery silently omits symlinked files, hard-linked files, dot-prefixed filena
 
 ## Identifier-first matching
 
-Version 3.0 treats valid embedded release identifiers as the primary source of truth. Candidate resolution runs in this order:
+Version 3.1 treats valid embedded release identifiers as the primary source of truth. Candidate resolution runs in this order:
 
 1. **Embedded UPC/barcode.** A valid local UPC receives an exact Apple lookup. If Apple returns the release for that UPC, the candidate is identifier-verified. When a release MBID is also present, MusicBrainz is consulted to detect positive identifier contradictions; an unavailable or unresolvable MBID leaves the exact UPC match intact with a warning.
 2. **MusicBrainz direct Apple relationship.** If the embedded UPC does not resolve and a valid release MBID exists, the program follows the release's Apple Music/iTunes URL relationship. When an exact UPC result already exists, this relationship cross-validates and narrows it to the common Apple collection.
 3. **MusicBrainz barcode.** If the MusicBrainz release has no Apple relationship but provides a valid barcode, that barcode receives an exact Apple lookup.
-4. **MBID-authoritative search.** If MusicBrainz establishes the release but exposes neither usable direct mapping, its canonical artist, album, track count, and release year constrain an order-independent Apple search. Search candidates retain those resolved fields in the report, and Apple rows are rechecked after lookup before MBID provenance is attached. Complete local recording-MBID sets are checked against the resolved release, and recording IDs that are not members of that resolved release stop matching. If MusicBrainz has merged an older release MBID, a validated MusicBrainz redirect to the canonical release is retained as auditable alias evidence instead of discarding the valid older Picard tag. MusicBrainz recording-ID aliases are not resolved individually in 3.0, so an older merged recording ID can conservatively produce `no_match`; retagging the album with current Picard data resolves that case without weakening release safety.
+4. **MBID-authoritative search.** If MusicBrainz establishes the release but exposes neither usable direct mapping, its canonical artist, album, track count, and release year constrain an order-independent Apple search. Search candidates retain those resolved fields in the report, and Apple rows are rechecked after lookup before MBID provenance is attached. Complete local recording-MBID sets are checked against the resolved release, and recording IDs that are not members of that resolved release stop matching. If MusicBrainz has merged an older release MBID, a validated MusicBrainz redirect to the canonical release is retained as auditable alias evidence instead of discarding the valid older Picard tag. MusicBrainz recording-ID aliases are not resolved individually in this release, so an older merged recording ID can conservatively produce `no_match`; retagging the album with current Picard data resolves that case without weakening release safety.
 5. **Identifier-absent fallback.** Only when the local release has neither a valid UPC nor a valid release MBID does the program use the conservative 2.5-style album and distinctive-song searches followed by fuzzy scoring.
 
 ### Identifier-authoritative behavior
@@ -314,7 +316,9 @@ Every response is checked before use:
 
 HTML error pages, truncated images, unsupported formats, oversized images, decoder bombs, and cross-key cache entries are rejected.
 
-Accepted JPEG or PNG bytes are embedded as downloaded after validation; the program does not re-encode the artwork.
+The exact highest-resolution accepted source bytes are saved at the unique album root as `cover.jpg` or `cover.png`, using the image's validated native format rather than the URL suffix. A byte-identical existing cover is unchanged. A differing existing `cover.jpg`, `cover.jpeg`, or `cover.png` is preserved unless `--replace-existing` is present. If the grouped files do not have one safe album root beneath the selected library root, or that root also contains an omitted `00`/`DCC`/`GZS` path or another grouped release, dry-run reports a folder-cover preflight failure and no folder cover is written there.
+
+Most containers receive the validated source bytes unchanged. FLAC's native `PICTURE` metadata block has a fixed serialized-size limit, so a very large source image may not fit even though it decoded correctly. In that case, the program first derives an optimized JPEG at the original pixel dimensions. It reduces dimensions only if no same-dimension JPEG fits. The album-root folder cover remains the exact native JPEG or PNG source; only the FLAC embed payload is derived. Source and derived MIME type, dimensions, byte size, and SHA-256 are retained in the report.
 
 `--max-dimension PX` limits requested artwork dimensions to a value from 100 through 10,000 pixels. Apple may return the native dimensions rather than upscaling the image.
 
@@ -322,7 +326,7 @@ Accepted JPEG or PNG bytes are embedded as downloaded after validation; the prog
 
 | Container | Artwork mechanism | Replacement behavior |
 |---|---|---|
-| FLAC | Native FLAC `Picture` | Replaces picture type 3 only; preserves other picture roles |
+| FLAC | Native FLAC `Picture` | Replaces picture type 3 only; preserves other picture roles; derives a size-fitting JPEG only when the validated source cannot fit the FLAC metadata-block limit |
 | MP3 | ID3 `APIC` | Supports ID3v2.3/v2.4; preserves non-front APIC and exact ID3v1 bytes |
 | Audio-only M4A/MP4 | MP4 `covr` | Adds when absent; explicit replacement replaces every `covr` value |
 | Ogg Vorbis / Opus | `METADATA_BLOCK_PICTURE` | Replaces picture type 3; preserves other valid pictures |
@@ -351,6 +355,8 @@ For an accepted album in `--apply` mode:
 8. The fallback moves the current visible entry aside with `RENAME_NOREPLACE`, verifies whether it is still the expected original, then installs the staged entry with `RENAME_NOREPLACE`. A concurrent editor save is never overwritten.
 9. The original and journal are released only after content, metadata, namespace state, and directory durability are verified. An interrupted fallback is rolled back automatically when safe; otherwise every version and the journal are retained for fail-closed recovery.
 
+The album-root `cover.jpg` or `cover.png` is a separate output. It always uses the exact validated source artwork, is constrained to a unique root beneath the selected library root, and follows the same `--replace-existing` choice as embedded front covers.
+
 On startup, the normal library walk also detects incomplete journals. Dry-run reports them without mutating recovery state; `--apply` recovers them before metadata parsing or network access and rescans only when recovery was needed. During the fallback's two same-directory renames, the visible name is briefly absent; the durable journal and verified recovery link cover process or machine interruption in that interval.
 
 If an error occurs before a namespace transition, the original path remains untouched. If an interruption or durability error happens during or after a transition, the tool either restores the verified original durably or reports explicit committed uncertainty while retaining recovery material.
@@ -359,16 +365,19 @@ This protects against realistic accidental data loss, malformed inputs, interrup
 
 ## Reports and statuses
 
-The JSON report uses schema version 3 and records:
+The JSON report uses schema version 4 and records:
 
 - scan mode, root, storefront, discovery counts, and DCC omissions;
-- local album identity, physical files, UPC, release MBID, grouped identifier conflicts, and whether per-track MusicBrainz provenance is complete;
+- local album identity, physical files, UPC, release MBID, grouped identifier conflicts, whether per-track MusicBrainz provenance is complete, declared disc/track totals, effective topology, and missing positions;
 - the local-input match basis (`upc`, `musicbrainz`, `musicbrainz+upc`, or `legacy`), the actual `identifier_resolution` path, the candidate's verified UPC and release MBID, whether its recording MBIDs were verified, and canonical MusicBrainz artist/title/count/year fields used by inferred MBID searches; when MusicBrainz omits a release count, `musicbrainz_search_track_count` and its `local` source explicitly record the bounded local-count fallback without mislabeling it as resolved MusicBrainz data;
+- catalog-discovery stages, collection lookup completeness, and post-lookup count/year validation so a discarded identifier candidate remains diagnosable;
 - identifier-resolution and presentation-difference warnings, including order or topology differences intentionally accepted by an authoritative match;
 - Apple candidates and component scores;
 - eligibility and rejection reasons;
-- selected artwork facts;
+- selected source-artwork facts, any FLAC embed derivation, and the album-root folder-cover target and result;
 - per-file preflight, embed, verification, and failure results when processing reaches that stage.
+
+Top-level summary counters keep album failures, metadata/discovery failures, adapter-preflight failures, folder-cover failures, and per-file embed failures separate. A failed file operation therefore no longer inflates the count of albums that failed matching or processing.
 
 Statuses have different scopes:
 
@@ -381,9 +390,9 @@ Statuses have different scopes:
 | `low_confidence` | Album | The best candidate did not clear the score requirements |
 | `ambiguous` | Album | Competing candidates were too close to choose safely |
 | `preflight_failed` | Album | Local validation failed before any album file changed |
-| `applied` | Album | Artwork was embedded and verified |
+| `applied` | Album | At least one embedded or album-folder artwork output was written and verified |
 | `unchanged` | Album | No file required a change |
-| `partial_failure` | Album | At least one file committed, and at least one operation failed or remained unverified |
+| `partial_failure` | Album | At least one audio or folder-artwork output committed, and at least one operation failed or remained unverified |
 | `failed` | Album or file | Processing failed without being reported as successfully applied |
 | `committed_unverified` | File | Replacement occurred, but a post-commit verification or durability check failed; the album becomes `partial_failure` |
 | `committed_interrupted` | File | An interrupt arrived after this file was committed |
@@ -405,9 +414,9 @@ The optional positional `root` is the library root; it defaults to the current d
 
 | Option | Purpose |
 |---|---|
-| `--apply` | Atomically embed verified artwork |
+| `--apply` | Atomically embed verified artwork and save the validated source at the album root |
 | `-v`, `--verbose` | Show discovery, candidate-score, and per-file details |
-| `--replace-existing` | Replace existing front covers; requires `--apply` |
+| `--replace-existing` | Replace existing embedded front covers and differing album-root folder covers; requires `--apply` |
 | `--country CC` | Select the Apple storefront; default `US` |
 | `--cache-dir PATH` | Override `ROOT/.apple-artwork-cache` |
 | `--report PATH` | Set an in-root JSON report path |
@@ -452,11 +461,15 @@ Add a correct UPC or MusicBrainz release MBID when available. `--allow-short-rel
 
 ### Existing artwork is skipped
 
-After reviewing the dry run, use:
+This applies to embedded front artwork and to a differing `cover.jpg`, `cover.jpeg`, or `cover.png` at the album root. After reviewing the dry run, use:
 
 ```bash
 apple-artwork "/path/to/Music" --apply --replace-existing --overwrite-report
 ```
+
+### FLAC reports that a metadata block is too long
+
+A FLAC `PICTURE` block can hold at most 16,777,215 serialized bytes, including its image data and metadata fields. Version 3.1 automatically tries a same-dimension optimized JPEG embed payload and downscales only if that is still too large. The native source image remains unchanged in the album-root `cover.jpg` or `cover.png`; inspect the source and embed-derivation fields in the report to see what was used.
 
 ### Unsupported or malformed container
 
@@ -476,7 +489,7 @@ Only release metadata needed for catalog search is sent after local adapter pref
 
 Audio files are never uploaded. During `--apply`, the program calculates local SHA-256 digests over container-specific encoded-audio regions before and after staging to detect unintended changes. Those transient audio hashes are not cached, reported, or transmitted.
 
-Downloaded artwork bytes are hashed for cache integrity and exact post-write verification. The report records the selected artwork hash.
+Downloaded artwork bytes are hashed for cache integrity, exact folder-cover verification, and post-write verification. The report records the selected source hash and, when FLAC required a derived embed payload, the derived hash and dimensions.
 
 ## Testing
 

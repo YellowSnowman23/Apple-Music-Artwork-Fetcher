@@ -71,6 +71,9 @@ def candidate_ids_from_album_search(
         artist_score = text_similarity(artist, row_artist)
         exact_count = track_count is not None and _as_int(row.get("trackCount")) == track_count
         row_year = _year(str(row.get("releaseDate") or ""))
+        compatible_year = not (
+            release_year is not None and row_year is not None and abs(release_year - row_year) > 1
+        )
         if identifier_first:
             if (
                 not _musicbrainz_search_artist_and_features_match(
@@ -81,12 +84,6 @@ def candidate_ids_from_album_search(
                 )
                 or _musicbrainz_album_identity(album) != _musicbrainz_album_identity(row_album)
                 or _explicit_remaster_years_conflict(album, row_album)
-                or (track_count is not None and not exact_count)
-                or (
-                    release_year is not None
-                    and row_year is not None
-                    and abs(release_year - row_year) > 1
-                )
             ):
                 continue
         elif not _artists_equivalent(artist, row_artist) or (
@@ -94,10 +91,84 @@ def candidate_ids_from_album_search(
         ):
             continue
         ranked.append(
-            (0.57 * album_score + 0.38 * artist_score + 0.05 * float(exact_count), collection_id)
+            (
+                0.52 * album_score
+                + 0.33 * artist_score
+                + 0.10 * float(exact_count)
+                + 0.05 * float(compatible_year),
+                collection_id,
+            )
         )
     ranked.sort(key=lambda item: (-item[0], item[1]))
     return list(dict.fromkeys(collection_id for _, collection_id in ranked[:limit]))
+
+
+def _album_search_diagnostics(
+    rows: Iterable[Mapping[str, object]],
+    selected_ids: Iterable[int],
+    artist: str,
+    album: str,
+    *,
+    track_count: int | None,
+    identifier_first: bool,
+) -> dict[str, object]:
+    """Explain discovery filtering without retaining raw provider metadata."""
+    materialized = tuple(rows)
+    selected = set(selected_ids)
+    by_collection: dict[int, Mapping[str, object]] = {}
+    invalid_id_rows = 0
+    for row in materialized:
+        collection_id = _as_int(row.get("collectionId"))
+        if collection_id is None or collection_id < 1:
+            invalid_id_rows += 1
+            continue
+        by_collection[collection_id] = row
+
+    rejection_reasons: dict[str, int] = {}
+
+    def record(reason: str) -> None:
+        rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+
+    if invalid_id_rows:
+        rejection_reasons["missing or invalid collection ID"] = invalid_id_rows
+    for collection_id, row in by_collection.items():
+        if collection_id in selected:
+            continue
+        if not row.get("artworkUrl100"):
+            record("missing artwork URL")
+            continue
+        row_album = str(row.get("collectionName") or "")
+        row_artist = str(row.get("collectionArtistName") or row.get("artistName") or "")
+        if identifier_first:
+            if not _musicbrainz_search_artist_and_features_match(
+                album,
+                artist,
+                row_album,
+                row_artist,
+            ):
+                record("resolved MusicBrainz artist or feature-credit mismatch")
+            elif _musicbrainz_album_identity(album) != _musicbrainz_album_identity(row_album):
+                record("resolved MusicBrainz album identity mismatch")
+            elif _explicit_remaster_years_conflict(album, row_album):
+                record("explicit remaster-year conflict")
+            else:
+                record("bounded search candidate limit")
+            continue
+        exact_count = track_count is not None and _as_int(row.get("trackCount")) == track_count
+        if not _artists_equivalent(artist, row_artist):
+            record("artist mismatch")
+        elif text_similarity(album, row_album) < 0.62 and not exact_count:
+            record("album similarity below discovery threshold")
+        else:
+            record("bounded search candidate limit")
+    return {
+        "raw_rows": len(materialized),
+        "raw_collections": len(by_collection),
+        "selected_collections": len(selected),
+        "rejected_collections": len(set(by_collection) - selected),
+        "rejection_reasons": rejection_reasons,
+        "selected_collection_ids": sorted(selected),
+    }
 
 
 def _search_title_base(value: str) -> str:
@@ -157,7 +228,7 @@ def catalog_albums_from_lookup(rows: Iterable[Mapping[str, object]]) -> list[Cat
     for collection_id, collection in collection_rows.items():
         tracks_data = track_rows.get(collection_id, [])
         declared_count = _as_int(collection.get("trackCount"))
-        if declared_count is None or declared_count < 1 or len(tracks_data) != declared_count:
+        if declared_count is None or declared_count < 1 or not tracks_data:
             continue
         seen_positions: set[tuple[int, int]] = set()
         positions_by_disc: dict[int, set[int]] = defaultdict(set)
@@ -194,6 +265,29 @@ def catalog_albums_from_lookup(rows: Iterable[Mapping[str, object]]) -> list[Cat
             numbers != set(range(1, max(numbers) + 1)) for numbers in positions_by_disc.values()
         ):
             continue
+        effective_count = declared_count
+        if len(tracks_data) != declared_count:
+            # Apple's collection-level ``trackCount`` can include a music video even
+            # when an ``entity=song`` lookup returned the complete song tracklist.
+            # In that case every song row independently declares the complete size of
+            # its disc, which lets us prove completeness without trusting the mixed-
+            # media collection count.
+            counts_by_disc: dict[int, set[int]] = defaultdict(set)
+            row_counts_complete = True
+            for row in tracks_data:
+                disc = _as_int(row.get("discNumber"))
+                row_count = _as_int(row.get("trackCount"))
+                if disc is None or row_count is None or row_count < 1:
+                    row_counts_complete = False
+                    break
+                counts_by_disc[disc].add(row_count)
+            if not row_counts_complete or any(
+                len(counts_by_disc.get(disc, set())) != 1
+                or next(iter(counts_by_disc[disc])) != len(numbers)
+                for disc, numbers in positions_by_disc.items()
+            ):
+                continue
+            effective_count = len(tracks_data)
         album_name = str(collection.get("collectionName") or "").strip()
         album_artist = str(
             collection.get("collectionArtistName") or collection.get("artistName") or ""
@@ -211,11 +305,231 @@ def catalog_albums_from_lookup(rows: Iterable[Mapping[str, object]]) -> list[Cat
                 artist=album_artist,
                 release_year=_year(str(collection.get("releaseDate") or "")),
                 artwork_url=artwork_url,
-                track_count=declared_count,
+                track_count=effective_count,
                 tracks=tuple(tracks),
             )
         )
     return sorted(albums, key=lambda album: album.collection_id)
+
+
+def _identifier_albums_from_lookup(
+    rows: Iterable[Mapping[str, object]],
+) -> tuple[list[CatalogAlbum], tuple[str, ...]]:
+    """Retain artwork-bearing collections reached by an exact external identifier.
+
+    Strict catalog matching still requires a reconstructable Apple song tracklist.
+    An exact UPC, MusicBrainz Apple relationship, or MusicBrainz barcode is different:
+    the collection relationship itself establishes identity, so provider omissions and
+    topology presentation must remain auditable warnings instead of erasing the cover.
+    """
+
+    materialized = tuple(rows)
+    strict_by_id = {
+        album.collection_id: album for album in catalog_albums_from_lookup(materialized)
+    }
+    collection_rows: dict[int, Mapping[str, object]] = {}
+    song_rows: dict[int, list[Mapping[str, object]]] = defaultdict(list)
+    for row in materialized:
+        collection_id = _as_int(row.get("collectionId"))
+        if collection_id is None or collection_id < 1:
+            continue
+        if row.get("wrapperType") == "collection":
+            collection_rows[collection_id] = row
+        elif row.get("wrapperType") == "track" and row.get("kind") == "song":
+            song_rows[collection_id].append(row)
+
+    albums: list[CatalogAlbum] = []
+    diagnostics: list[str] = []
+    for collection_id in sorted(collection_rows):
+        collection = collection_rows[collection_id]
+        album_name = str(collection.get("collectionName") or "").strip()
+        album_artist = str(
+            collection.get("collectionArtistName") or collection.get("artistName") or ""
+        ).strip()
+        artwork_url = str(collection.get("artworkUrl100") or "").strip()
+        if not album_name or not album_artist or not artwork_url:
+            continue
+
+        tracks_data = song_rows.get(collection_id, [])
+        declared_count = _as_int(collection.get("trackCount"))
+        strict = strict_by_id.get(collection_id)
+        if strict is not None:
+            albums.append(strict)
+            if declared_count != len(tracks_data):
+                diagnostics.append(
+                    f"Apple collection {collection_id} declared {declared_count!r} catalog "
+                    f"items but returned {len(tracks_data)} complete song rows; direct "
+                    "identifier evidence retained the artwork-bearing collection"
+                )
+            continue
+
+        tracks: list[CatalogTrack] = []
+        seen_positions: set[tuple[int, int]] = set()
+        positions_by_disc: dict[int, set[int]] = defaultdict(set)
+        valid_tracks = True
+        for row in tracks_data:
+            title = str(row.get("trackName") or "").strip()
+            artist = str(row.get("artistName") or "").strip()
+            disc = _as_int(row.get("discNumber"))
+            number = _as_int(row.get("trackNumber"))
+            if not title or not artist or disc is None or disc < 1 or number is None or number < 1:
+                valid_tracks = False
+                break
+            position = (disc, number)
+            if position in seen_positions:
+                valid_tracks = False
+                break
+            seen_positions.add(position)
+            positions_by_disc[disc].add(number)
+            tracks.append(
+                CatalogTrack(
+                    title=title,
+                    artist=artist,
+                    duration_ms=_as_int(row.get("trackTimeMillis")),
+                    disc_number=disc,
+                    track_number=number,
+                )
+            )
+
+        if not valid_tracks:
+            tracks = []
+            diagnostics.append(
+                f"Apple collection {collection_id} returned malformed or duplicate song rows; "
+                "direct identifier evidence retained only the artwork-bearing collection"
+            )
+        elif not tracks:
+            diagnostics.append(
+                f"Apple collection {collection_id} returned no song rows; direct identifier "
+                "evidence retained the artwork-bearing collection"
+            )
+        else:
+            contiguous_discs = set(positions_by_disc) == set(
+                range(1, max(positions_by_disc, default=0) + 1)
+            )
+            contiguous_tracks = all(
+                numbers == set(range(1, max(numbers) + 1)) for numbers in positions_by_disc.values()
+            )
+            if not contiguous_discs or not contiguous_tracks:
+                diagnostics.append(
+                    f"Apple collection {collection_id} returned non-contiguous disc/track "
+                    "topology; direct identifier evidence retained the provider presentation"
+                )
+            elif declared_count != len(tracks):
+                diagnostics.append(
+                    f"Apple collection {collection_id} declared {declared_count!r} catalog "
+                    f"items but returned {len(tracks)} song rows; direct identifier evidence "
+                    "retained the artwork-bearing collection"
+                )
+
+        tracks.sort(
+            key=lambda track: (
+                track.disc_number or 0,
+                track.track_number or 0,
+                track.title,
+            )
+        )
+        # Preserve Apple's declaration when strict parsing could not prove that the
+        # returned song rows are complete.  Matching can then treat the disagreement
+        # as incomplete provider presentation instead of mistaking a partial row set
+        # for an exact release-size fingerprint.
+        effective_count = (
+            declared_count if declared_count is not None and declared_count > 0 else None
+        )
+        albums.append(
+            CatalogAlbum(
+                collection_id=collection_id,
+                album=album_name,
+                artist=album_artist,
+                release_year=_year(str(collection.get("releaseDate") or "")),
+                artwork_url=artwork_url,
+                track_count=effective_count,
+                tracks=tuple(tracks),
+            )
+        )
+    return albums, tuple(dict.fromkeys(diagnostics))
+
+
+def _lookup_response_diagnostics(
+    rows: Iterable[Mapping[str, object]],
+    albums: Iterable[CatalogAlbum],
+    *,
+    identifier_authoritative: bool,
+    requested_collection_ids: Iterable[int] | None = None,
+    parser_warnings: Iterable[str] = (),
+) -> dict[str, object]:
+    """Summarize one lookup path using only JSON-serializable values."""
+    materialized = tuple(rows)
+    parsed_ids = {album.collection_id for album in albums}
+    collection_rows = [row for row in materialized if row.get("wrapperType") == "collection"]
+    song_rows = [
+        row
+        for row in materialized
+        if row.get("wrapperType") == "track" and row.get("kind") == "song"
+    ]
+    response_collection_ids = {
+        collection_id
+        for row in collection_rows
+        if (collection_id := _as_int(row.get("collectionId"))) is not None and collection_id > 0
+    }
+    requested_ids = (
+        set(requested_collection_ids)
+        if requested_collection_ids is not None
+        else set(response_collection_ids)
+    )
+    rejected_ids = requested_ids - parsed_ids
+    valid_identity_ids = {
+        collection_id
+        for row in collection_rows
+        if (collection_id := _as_int(row.get("collectionId"))) is not None
+        and collection_id > 0
+        and str(row.get("collectionName") or "").strip()
+        and str(row.get("collectionArtistName") or row.get("artistName") or "").strip()
+        and str(row.get("artworkUrl100") or "").strip()
+    }
+    rejection_reasons: dict[str, int] = {}
+
+    def record(reason: str, count: int) -> None:
+        if count:
+            rejection_reasons[reason] = count
+
+    record(
+        "requested collection absent from Apple response",
+        len(requested_ids - response_collection_ids),
+    )
+    record(
+        "collection missing title, artist, or artwork",
+        len((requested_ids & response_collection_ids) - valid_identity_ids),
+    )
+    structurally_rejected = rejected_ids & valid_identity_ids
+    if identifier_authoritative:
+        record(
+            "identifier response lacked a retainable collection row",
+            len(structurally_rejected),
+        )
+    else:
+        record(
+            "strict complete-song-tracklist validation",
+            len(structurally_rejected),
+        )
+    song_collection_ids = {
+        collection_id
+        for row in song_rows
+        if (collection_id := _as_int(row.get("collectionId"))) is not None and collection_id > 0
+    }
+    record(
+        "song rows without a collection row",
+        len(song_collection_ids - response_collection_ids),
+    )
+    return {
+        "raw_rows": len(materialized),
+        "collection_rows": len(collection_rows),
+        "song_rows": len(song_rows),
+        "requested_collections": len(requested_ids),
+        "parsed_collections": len(parsed_ids),
+        "rejected_collections": len(rejected_ids),
+        "rejection_reasons": rejection_reasons,
+        "parser_warnings": list(dict.fromkeys(parser_warnings)),
+    }
 
 
 class AppleCatalogClient:
@@ -256,6 +570,7 @@ class AppleCatalogClient:
         self.max_response_bytes = max(1, min(int(max_response_bytes), MAX_API_BYTES))
         self._last_request = 0.0
         self.last_identifier_warnings: tuple[str, ...] = ()
+        self.last_discovery_diagnostics: dict[str, object] = {}
 
     @staticmethod
     def _cache_key(url: str, params: Mapping[str, object]) -> str:
@@ -386,11 +701,29 @@ class AppleCatalogClient:
             raise last_error
         raise requests.RequestException("Apple API request failed after retries")
 
-    def _lookup_collection_ids(self, collection_ids: Iterable[int]) -> list[CatalogAlbum]:
+    def _lookup_collection_ids_with_parser(
+        self,
+        collection_ids: Iterable[int],
+        *,
+        identifier_authoritative: bool,
+    ) -> tuple[list[CatalogAlbum], tuple[str, ...], dict[str, object]]:
         ordered_ids = list(dict.fromkeys(collection_ids))[:24]
         albums: list[CatalogAlbum] = []
+        diagnostics: list[str] = []
+        raw_rows: list[Mapping[str, object]] = []
+        request_count = 0
+        unrequested_rows = 0
+
+        def parse(
+            rows: Iterable[Mapping[str, object]],
+        ) -> tuple[list[CatalogAlbum], tuple[str, ...]]:
+            if identifier_authoritative:
+                return _identifier_albums_from_lookup(rows)
+            return catalog_albums_from_lookup(rows), ()
+
         for start in range(0, len(ordered_ids), 8):
             chunk = ordered_ids[start : start + 8]
+            request_count += 1
             lookup_rows = self._request_results(
                 ITUNES_LOOKUP_URL,
                 {
@@ -400,17 +733,21 @@ class AppleCatalogClient:
                     "limit": 200,
                 },
             )
+            raw_rows.extend(lookup_rows)
             chunk_ids = set(chunk)
-            parsed = [
-                album
-                for album in catalog_albums_from_lookup(lookup_rows)
-                if album.collection_id in chunk_ids
+            requested_rows = [
+                row for row in lookup_rows if _as_int(row.get("collectionId")) in chunk_ids
             ]
+            unrequested_rows += len(lookup_rows) - len(requested_rows)
+            parsed, parsed_diagnostics = parse(requested_rows)
+            parsed = [album for album in parsed if album.collection_id in chunk_ids]
+            diagnostics.extend(parsed_diagnostics)
             albums.extend(parsed)
             returned = {album.collection_id for album in parsed}
             for missing_id in (
                 collection_id for collection_id in chunk if collection_id not in returned
             ):
+                request_count += 1
                 individual_rows = self._request_results(
                     ITUNES_LOOKUP_URL,
                     {
@@ -420,12 +757,44 @@ class AppleCatalogClient:
                         "limit": 200,
                     },
                 )
+                raw_rows.extend(individual_rows)
+                requested_individual_rows = [
+                    row for row in individual_rows if _as_int(row.get("collectionId")) == missing_id
+                ]
+                unrequested_rows += len(individual_rows) - len(requested_individual_rows)
+                individual_albums, individual_diagnostics = parse(requested_individual_rows)
+                diagnostics.extend(individual_diagnostics)
                 albums.extend(
-                    album
-                    for album in catalog_albums_from_lookup(individual_rows)
-                    if album.collection_id == missing_id
+                    album for album in individual_albums if album.collection_id == missing_id
                 )
-        return list({album.collection_id: album for album in albums}.values())
+        unique_albums = list({album.collection_id: album for album in albums}.values())
+        unique_diagnostics = tuple(dict.fromkeys(diagnostics))
+        lookup_diagnostics = _lookup_response_diagnostics(
+            raw_rows,
+            unique_albums,
+            identifier_authoritative=identifier_authoritative,
+            requested_collection_ids=ordered_ids,
+            parser_warnings=unique_diagnostics,
+        )
+        lookup_diagnostics["requests"] = request_count
+        lookup_diagnostics["unrequested_rows"] = unrequested_rows
+        return unique_albums, unique_diagnostics, lookup_diagnostics
+
+    def _lookup_collection_ids(self, collection_ids: Iterable[int]) -> list[CatalogAlbum]:
+        albums, _diagnostics, _lookup_diagnostics = self._lookup_collection_ids_with_parser(
+            collection_ids,
+            identifier_authoritative=False,
+        )
+        return albums
+
+    def _lookup_identifier_collection_ids(
+        self,
+        collection_ids: Iterable[int],
+    ) -> tuple[list[CatalogAlbum], tuple[str, ...], dict[str, object]]:
+        return self._lookup_collection_ids_with_parser(
+            collection_ids,
+            identifier_authoritative=True,
+        )
 
     def _song_fallback_ids(self, group: AlbumGroup) -> list[int]:
         ranked_tracks = sorted(
@@ -461,9 +830,18 @@ class AppleCatalogClient:
     def find_candidates(self, group: AlbumGroup) -> list[CatalogAlbum]:
         warnings: list[str] = list(group.identifier_warnings)
         self.last_identifier_warnings = ()
+        discovery: dict[str, object] = {
+            "match_basis": matching_basis(group),
+            "resolved_musicbrainz": None,
+            "stages": {},
+        }
+        self.last_discovery_diagnostics = discovery
 
         def finish(albums: list[CatalogAlbum]) -> list[CatalogAlbum]:
             self.last_identifier_warnings = tuple(warnings)
+            discovery["candidate_count"] = len(albums)
+            discovery["warning_count"] = len(self.last_identifier_warnings)
+            self.last_discovery_diagnostics = discovery
             return albums
 
         if group.identifier_conflicts:
@@ -483,26 +861,46 @@ class AppleCatalogClient:
                     "limit": 200,
                 },
             )
+            parsed_upc_albums, upc_diagnostics = _identifier_albums_from_lookup(upc_rows)
+            stages = discovery["stages"]
+            assert isinstance(stages, dict)
+            stages["embedded_upc"] = _lookup_response_diagnostics(
+                upc_rows,
+                parsed_upc_albums,
+                identifier_authoritative=True,
+                parser_warnings=upc_diagnostics,
+            )
+            warnings.extend(f"embedded UPC: {warning}" for warning in upc_diagnostics)
             upc_albums = [
                 replace(
                     album,
                     verified_barcode=local_barcode,
                     identifier_resolution="embedded_upc",
                 )
-                for album in catalog_albums_from_lookup(upc_rows)
+                for album in parsed_upc_albums
             ]
             if upc_albums and release_id is None:
                 return finish(upc_albums)
             if not upc_albums:
-                warnings.append("the embedded UPC returned no usable complete Apple album")
+                warnings.append(
+                    "the embedded UPC returned no usable artwork-bearing Apple collection"
+                )
             if not upc_albums and release_id is None:
                 return finish([])
 
         resolution = None
         if release_id is not None:
+            discovery["resolved_musicbrainz"] = {
+                "status": "pending",
+                "requested_release_id": release_id,
+            }
             try:
                 resolved = self.musicbrainz_client.resolve(release_id)  # type: ignore[attr-defined]
             except Exception:
+                discovery["resolved_musicbrainz"] = {
+                    "status": "lookup_failed",
+                    "requested_release_id": release_id,
+                }
                 if upc_albums:
                     warnings.append(
                         "the MusicBrainz release lookup failed; the exact UPC match was "
@@ -515,6 +913,10 @@ class AppleCatalogClient:
                 )
                 return finish([])
             if resolved is None:
+                discovery["resolved_musicbrainz"] = {
+                    "status": "unresolved",
+                    "requested_release_id": release_id,
+                }
                 if upc_albums:
                     warnings.append(
                         "MusicBrainz did not resolve the embedded release MBID; the exact "
@@ -528,12 +930,20 @@ class AppleCatalogClient:
                 return finish([])
             if isinstance(resolved, _ResolvedMusicBrainzRelease):
                 if type(self.musicbrainz_client) is not MusicBrainzClient:
+                    discovery["resolved_musicbrainz"] = {
+                        "status": "untrusted_alias_provenance",
+                        "requested_release_id": release_id,
+                    }
                     warnings.append(
                         "a custom MusicBrainz resolver cannot assert merged-release "
                         "alias provenance"
                     )
                     return finish([])
                 if _normalize_release_id(resolved.requested_release_id) != release_id:
+                    discovery["resolved_musicbrainz"] = {
+                        "status": "requested_release_mismatch",
+                        "requested_release_id": release_id,
+                    }
                     warnings.append(
                         "MusicBrainz returned resolution evidence for a different release MBID"
                     )
@@ -544,16 +954,29 @@ class AppleCatalogClient:
                 resolution = resolved
                 alias_provenance = False
             else:
+                discovery["resolved_musicbrainz"] = {
+                    "status": "malformed",
+                    "requested_release_id": release_id,
+                }
                 warnings.append("MusicBrainz returned malformed release resolution evidence")
                 return finish([])
             resolved_release_id = _normalize_release_id(resolution.release_id)
             if resolved_release_id is None:
+                discovery["resolved_musicbrainz"] = {
+                    "status": "invalid_release_id",
+                    "requested_release_id": release_id,
+                }
                 warnings.append(
                     "MusicBrainz returned an invalid release MBID for the embedded identifier"
                 )
                 return finish([])
             if resolved_release_id != release_id:
                 if not alias_provenance:
+                    discovery["resolved_musicbrainz"] = {
+                        "status": "unsolicited_release_redirect",
+                        "requested_release_id": release_id,
+                        "resolved_release_id": resolved_release_id,
+                    }
                     warnings.append(
                         "MusicBrainz returned a different release MBID than the embedded identifier"
                     )
@@ -587,6 +1010,11 @@ class AppleCatalogClient:
                     )
                 )
             ):
+                discovery["resolved_musicbrainz"] = {
+                    "status": "malformed",
+                    "requested_release_id": release_id,
+                    "resolved_release_id": resolved_release_id,
+                }
                 warnings.append("MusicBrainz returned malformed release resolution evidence")
                 return finish([])
             normalized_barcode = _normalize_barcode(resolution.barcode)
@@ -605,6 +1033,11 @@ class AppleCatalogClient:
                 or any(recording_id is None for recording_id in normalized_recording_ids)
                 or not collection_ids_are_valid
             ):
+                discovery["resolved_musicbrainz"] = {
+                    "status": "malformed",
+                    "requested_release_id": release_id,
+                    "resolved_release_id": resolved_release_id,
+                }
                 warnings.append("MusicBrainz returned malformed release resolution evidence")
                 return finish([])
             normalized_collection_ids = tuple(sorted(set(resolution.apple_collection_ids)))
@@ -634,6 +1067,19 @@ class AppleCatalogClient:
                     if recording_id is not None
                 ),
             )
+            discovery["resolved_musicbrainz"] = {
+                "status": "resolved",
+                "requested_release_id": release_id,
+                "resolved_release_id": resolution.release_id,
+                "canonical_alias": resolution.release_id != release_id,
+                "title": resolution.title,
+                "artist": resolution.artist,
+                "track_count": resolution.track_count,
+                "release_year": resolution.release_year,
+                "barcode": resolution.barcode,
+                "apple_collection_ids": list(resolution.apple_collection_ids),
+                "recording_id_count": len(resolution.recording_ids),
+            }
         if (
             resolution is not None
             and local_barcode is not None
@@ -706,7 +1152,15 @@ class AppleCatalogClient:
                 ]
             )
         if resolution is not None and resolution.apple_collection_ids:
-            related = self._lookup_collection_ids(resolution.apple_collection_ids)
+            related, relation_diagnostics, relation_lookup_diagnostics = (
+                self._lookup_identifier_collection_ids(resolution.apple_collection_ids)
+            )
+            stages = discovery["stages"]
+            assert isinstance(stages, dict)
+            stages["musicbrainz_apple_relation"] = relation_lookup_diagnostics
+            warnings.extend(
+                f"MusicBrainz Apple relationship: {warning}" for warning in relation_diagnostics
+            )
             if related:
                 return finish(
                     [
@@ -719,7 +1173,9 @@ class AppleCatalogClient:
                         for album in related
                     ]
                 )
-            warnings.append("MusicBrainz Apple relationship returned no usable complete album")
+            warnings.append(
+                "MusicBrainz Apple relationship returned no usable artwork-bearing Apple collection"
+            )
         if resolution is not None and resolution.barcode:
             resolved_upc_rows = self._request_results(
                 ITUNES_LOOKUP_URL,
@@ -730,6 +1186,18 @@ class AppleCatalogClient:
                     "limit": 200,
                 },
             )
+            parsed_resolved_upc_albums, barcode_diagnostics = _identifier_albums_from_lookup(
+                resolved_upc_rows
+            )
+            stages = discovery["stages"]
+            assert isinstance(stages, dict)
+            stages["musicbrainz_barcode"] = _lookup_response_diagnostics(
+                resolved_upc_rows,
+                parsed_resolved_upc_albums,
+                identifier_authoritative=True,
+                parser_warnings=barcode_diagnostics,
+            )
+            warnings.extend(f"MusicBrainz barcode: {warning}" for warning in barcode_diagnostics)
             resolved_upc_albums = [
                 replace(
                     album,
@@ -738,11 +1206,13 @@ class AppleCatalogClient:
                     identifier_resolution="musicbrainz_barcode",
                     musicbrainz_recordings_verified=recordings_verified,
                 )
-                for album in catalog_albums_from_lookup(resolved_upc_rows)
+                for album in parsed_resolved_upc_albums
             ]
             if resolved_upc_albums:
                 return finish(resolved_upc_albums)
-            warnings.append("the MusicBrainz barcode returned no usable complete Apple album")
+            warnings.append(
+                "the MusicBrainz barcode returned no usable artwork-bearing Apple collection"
+            )
 
         search_artist = resolution.artist if resolution is not None else group.album_artist
         search_album = resolution.title if resolution is not None else group.album
@@ -769,8 +1239,42 @@ class AppleCatalogClient:
             release_year=resolution.release_year if resolution is not None else group.year,
             identifier_first=matching_basis(group) != "legacy",
         )
-        albums = self._lookup_collection_ids(collection_ids) if collection_ids else []
+        search_diagnostics = _album_search_diagnostics(
+            search_rows,
+            collection_ids,
+            search_artist,
+            search_album,
+            track_count=search_count,
+            identifier_first=matching_basis(group) != "legacy",
+        )
+        if collection_ids:
+            albums, _lookup_warnings, lookup_diagnostics = self._lookup_collection_ids_with_parser(
+                collection_ids,
+                identifier_authoritative=False,
+            )
+        else:
+            albums = []
+            lookup_diagnostics = _lookup_response_diagnostics(
+                (),
+                (),
+                identifier_authoritative=False,
+                requested_collection_ids=(),
+            )
+            lookup_diagnostics["requests"] = 0
+            lookup_diagnostics["unrequested_rows"] = 0
+        search_diagnostics["lookup"] = lookup_diagnostics
+        stages = discovery["stages"]
+        assert isinstance(stages, dict)
+        stages["album_search"] = search_diagnostics
         if resolution is not None:
+            lookup_albums = albums
+            postlookup_rejection_reasons: dict[str, int] = {}
+
+            def record_postlookup_rejection(reason: str) -> None:
+                postlookup_rejection_reasons[reason] = (
+                    postlookup_rejection_reasons.get(reason, 0) + 1
+                )
+
             albums = [
                 replace(
                     album,
@@ -786,7 +1290,7 @@ class AppleCatalogClient:
                         "musicbrainz" if resolution.track_count is not None else "local"
                     ),
                 )
-                for album in albums
+                for album in lookup_albums
                 if _musicbrainz_search_identity_matches(
                     resolution.title,
                     resolution.artist,
@@ -798,6 +1302,29 @@ class AppleCatalogClient:
                     album.release_year,
                 )
             ]
+            accepted_ids = {album.collection_id for album in albums}
+            for album in lookup_albums:
+                if album.collection_id in accepted_ids:
+                    continue
+                if album.track_count != search_count:
+                    record_postlookup_rejection("resolved MusicBrainz track-count mismatch")
+                if (
+                    resolution.release_year is not None
+                    and album.release_year is not None
+                    and abs(resolution.release_year - album.release_year) > 1
+                ):
+                    record_postlookup_rejection("resolved MusicBrainz release-year mismatch")
+                if album.track_count == search_count and not (
+                    resolution.release_year is not None
+                    and album.release_year is not None
+                    and abs(resolution.release_year - album.release_year) > 1
+                ):
+                    record_postlookup_rejection(
+                        "resolved MusicBrainz title, artist, or edition revalidation"
+                    )
+            search_diagnostics["postlookup_accepted_collections"] = len(albums)
+            search_diagnostics["postlookup_rejected_collections"] = len(lookup_albums) - len(albums)
+            search_diagnostics["postlookup_rejection_reasons"] = postlookup_rejection_reasons
         has_verified_tracklist = any(
             score_candidate(group, album, allow_short_releases=True).eligible for album in albums
         )
